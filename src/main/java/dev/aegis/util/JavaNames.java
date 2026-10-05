@@ -38,6 +38,8 @@ public final class JavaNames {
         if (s == null || s.isEmpty()) return true;
         if (!isValidIdentifier(s)) return true;
         if (s.length() <= 2 && !Set.of("id","x","y","z","i","j","k","ok","ui").contains(s)) return true;
+        if (s.length() >= 3 && s.length() <= 6 && allSameCharacter(s)) return true;
+        if (s.length() >= 3 && s.length() <= 5 && monotonicAsciiLetters(s)) return true;
         int letters = 0, weird = 0, transitions = 0;
         char lastKind = 0;
         for (int i = 0; i < s.length(); i++) {
@@ -50,6 +52,20 @@ public final class JavaNames {
         if (weird > 0) return true;
         if (s.length() >= 12 && letters > 0 && transitions > s.length() / 2) return true;
         return s.matches("[Il1O0]{3,}") || s.matches("[a-zA-Z]{1,2}\\d{3,}");
+    }
+
+    private static boolean allSameCharacter(String s) {
+        int first=s.codePointAt(0);
+        for(int i=Character.charCount(first);i<s.length();){int cp=s.codePointAt(i);if(cp!=first)return false;i+=Character.charCount(cp);}
+        return true;
+    }
+
+    private static boolean monotonicAsciiLetters(String s) {
+        for(int i=0;i<s.length();i++)if(!Character.isLetter(s.charAt(i)))return false;
+        int delta=s.charAt(1)-s.charAt(0);
+        if(delta!=1&&delta!=-1)return false;
+        for(int i=2;i<s.length();i++)if(s.charAt(i)-s.charAt(i-1)!=delta)return false;
+        return true;
     }
 
     public static String escapeString(String s) {
