@@ -4,13 +4,10 @@ import dev.aegis.cfg.ControlFlowGraph;
 import dev.aegis.classfile.*;
 import java.util.*;
 
-/**
- * Native static deobfuscation analysis. It never executes target bytecode.
- * The result is a rewrite plan consumed by the source decompiler.
- */
 public final class Deobfuscator {
     private static final Object UNKNOWN = new Object();
     private static final Object NULL = new Object();
+    private static final Object NON_NULL = new Object();
 
     public DeobfuscationResult analyze(ClassFile cf, MemberInfo method, CodeAttribute code) {
         List<Instruction> insns = BytecodeDecoder.decode(code.code());
@@ -185,14 +182,14 @@ public final class Deobfuscator {
                 case 181 -> { f.pop(); f.pop(); }
                 case 182,183,184,185 -> invoke(cf, in, f, op, evaluator);
                 case 186 -> invokeDynamic(cf, in, f);
-                case 187 -> f.push(UNKNOWN);
-                case 188,189 -> { f.pop(); f.push(UNKNOWN); }
+                case 187 -> f.push(NON_NULL);
+                case 188,189 -> { f.pop(); f.push(NON_NULL); }
                 case 190 -> { f.pop(); f.push(UNKNOWN); }
                 case 192 -> { Object x=f.pop(); f.push(x); }
                 case 193 -> { Object x=f.pop(); f.push(x == NULL ? 0 : UNKNOWN); }
                 case 194,195 -> f.pop();
                 case 196 -> transferWide(in, f);
-                case 197 -> { int dims=in.u1(2); for(int i=0;i<dims;i++) f.pop(); f.push(UNKNOWN); }
+                case 197 -> { int dims=in.u1(2); for(int i=0;i<dims;i++) f.pop(); f.push(NON_NULL); }
                 default -> f.clearStack();
             }
         } catch (RuntimeException ex) {
@@ -240,16 +237,50 @@ public final class Deobfuscator {
                     case "isEmpty" -> s.isEmpty()?1:0;
                     case "charAt" -> (int)s.charAt(((Number)args.get(0)).intValue());
                     case "equals" -> Objects.equals(s,args.get(0))?1:0;
+                    case "equalsIgnoreCase" -> s.equalsIgnoreCase((String)args.get(0))?1:0;
                     case "startsWith" -> s.startsWith((String)args.get(0))?1:0;
                     case "endsWith" -> s.endsWith((String)args.get(0))?1:0;
                     case "contains" -> s.contains((CharSequence)args.get(0))?1:0;
+                    case "concat" -> s.concat((String)args.get(0));
+                    case "substring" -> args.size()==1?s.substring(((Number)args.get(0)).intValue()):s.substring(((Number)args.get(0)).intValue(),((Number)args.get(1)).intValue());
+                    case "indexOf" -> args.get(0) instanceof String x?s.indexOf(x):s.indexOf(((Number)args.get(0)).intValue());
+                    case "lastIndexOf" -> args.get(0) instanceof String x?s.lastIndexOf(x):s.lastIndexOf(((Number)args.get(0)).intValue());
                     default -> UNKNOWN;
                 };
             }
-            if("java/lang/Integer".equals(r.owner()) && r.name().equals("compare") && args.size()==2)
-                return Integer.compare(((Number)args.get(0)).intValue(),((Number)args.get(1)).intValue());
-            if("java/lang/Long".equals(r.owner()) && r.name().equals("compare") && args.size()==2)
-                return Long.compare(((Number)args.get(0)).longValue(),((Number)args.get(1)).longValue());
+            if("java/lang/String".equals(r.owner()) && r.name().equals("valueOf") && args.size()==1 && args.get(0)!=UNKNOWN && args.get(0)!=NULL && args.get(0)!=NON_NULL)
+                return String.valueOf(args.get(0));
+            if("java/util/Objects".equals(r.owner())){
+                if(r.name().equals("equals")&&args.size()==2&&args.get(0)!=UNKNOWN&&args.get(1)!=UNKNOWN&&args.get(0)!=NON_NULL&&args.get(1)!=NON_NULL)return Objects.equals(args.get(0),args.get(1))?1:0;
+                if(r.name().equals("isNull")&&args.size()==1&&args.get(0)!=UNKNOWN)return args.get(0)==NULL?1:0;
+                if(r.name().equals("nonNull")&&args.size()==1&&args.get(0)!=UNKNOWN)return args.get(0)==NULL?0:1;
+            }
+            if("java/lang/Integer".equals(r.owner())){
+                if(r.name().equals("compare")&&args.size()==2)return Integer.compare(((Number)args.get(0)).intValue(),((Number)args.get(1)).intValue());
+                if(r.name().equals("parseInt")&&args.size()>=1&&args.get(0) instanceof String x)return args.size()==1?Integer.parseInt(x):Integer.parseInt(x,((Number)args.get(1)).intValue());
+                if(r.name().equals("rotateLeft")&&args.size()==2)return Integer.rotateLeft(((Number)args.get(0)).intValue(),((Number)args.get(1)).intValue());
+                if(r.name().equals("rotateRight")&&args.size()==2)return Integer.rotateRight(((Number)args.get(0)).intValue(),((Number)args.get(1)).intValue());
+                if(r.name().equals("reverse")&&args.size()==1)return Integer.reverse(((Number)args.get(0)).intValue());
+                if(r.name().equals("bitCount")&&args.size()==1)return Integer.bitCount(((Number)args.get(0)).intValue());
+            }
+            if("java/lang/Long".equals(r.owner())){
+                if(r.name().equals("compare")&&args.size()==2)return Long.compare(((Number)args.get(0)).longValue(),((Number)args.get(1)).longValue());
+                if(r.name().equals("parseLong")&&args.size()>=1&&args.get(0) instanceof String x)return args.size()==1?Long.parseLong(x):Long.parseLong(x,((Number)args.get(1)).intValue());
+                if(r.name().equals("rotateLeft")&&args.size()==2)return Long.rotateLeft(((Number)args.get(0)).longValue(),((Number)args.get(1)).intValue());
+                if(r.name().equals("rotateRight")&&args.size()==2)return Long.rotateRight(((Number)args.get(0)).longValue(),((Number)args.get(1)).intValue());
+                if(r.name().equals("reverse")&&args.size()==1)return Long.reverse(((Number)args.get(0)).longValue());
+                if(r.name().equals("bitCount")&&args.size()==1)return Long.bitCount(((Number)args.get(0)).longValue());
+            }
+            if("java/lang/Math".equals(r.owner())&&args.stream().allMatch(Number.class::isInstance)){
+                Number a=(Number)args.get(0); Number b=args.size()>1?(Number)args.get(1):null;
+                boolean wide=r.descriptor().endsWith("J")||r.descriptor().contains("J");
+                return switch(r.name()){
+                    case "abs" -> wide?Math.abs(a.longValue()):Math.abs(a.intValue());
+                    case "min" -> wide?Math.min(a.longValue(),b.longValue()):Math.min(a.intValue(),b.intValue());
+                    case "max" -> wide?Math.max(a.longValue(),b.longValue()):Math.max(a.intValue(),b.intValue());
+                    default -> UNKNOWN;
+                };
+            }
         }catch(RuntimeException ignored){}
         return UNKNOWN;
     }
