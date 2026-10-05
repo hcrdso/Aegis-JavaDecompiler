@@ -41,12 +41,12 @@ public final class AegisFrame extends JFrame {
     private final JTextArea deobfuscation = Theme.codeArea();
     private final JTextArea mappingText = Theme.codeArea();
     private final JTextArea log = Theme.codeArea();
-    private final JLabel status = new JLabel("Ready — Aegis Decompiler");
+    private final JLabel status = new JLabel("Aegis");
     private final JLabel fileLabel = new JLabel("No file open");
     private final JProgressBar progress = new JProgressBar();
     private final JCheckBox aggressive = new JCheckBox("Aggressive renamer");
     private final JButton analyzeBtn = new JButton("Analyze");
-    private final JButton renameBtn = new JButton("Native Rename");
+    private final JButton renameBtn = new JButton("Rename");
     private final JButton exportBtn = new JButton("Export Clean JAR");
     private final JButton saveMapBtn = new JButton("Save Mappings");
 
@@ -78,7 +78,7 @@ public final class AegisFrame extends JFrame {
         file.add(open); file.add(attach); file.add(export); file.addSeparator(); file.add(exit);
         JMenu tools = new JMenu("Tools");
         JMenuItem a = new JMenuItem("Analyze obfuscation"); a.addActionListener(e -> runAnalysis());
-        JMenuItem r = new JMenuItem("Generate native semantic mappings"); r.addActionListener(e -> runRenamer());
+        JMenuItem r = new JMenuItem("Generate semantic mappings"); r.addActionListener(e -> runRenamer());
         tools.add(a); tools.add(r);
         b.add(file); b.add(tools); return b;
     }
@@ -92,7 +92,7 @@ public final class AegisFrame extends JFrame {
         exportBtn.addActionListener(e -> chooseExport()); saveMapBtn.addActionListener(e -> saveMappings());
         p.add(open); p.add(analyzeBtn); p.add(renameBtn); p.add(exportBtn); p.add(saveMapBtn);
         p.add(new JSeparator(SwingConstants.VERTICAL));
-        JLabel engine = new JLabel("Decompiler: Aegis"); engine.setForeground(Theme.ACCENT); p.add(engine);
+        JLabel aegis = new JLabel("Aegis"); aegis.setForeground(Theme.ACCENT); p.add(aegis);
         aggressive.setToolTipText("Renames more private members in the source/mapping view."); p.add(aggressive);
         fileLabel.setForeground(Theme.MUTED); fileLabel.setBorder(new EmptyBorder(0,8,0,12));
         outer.add(p, BorderLayout.CENTER); outer.add(fileLabel, BorderLayout.EAST); return outer;
@@ -142,7 +142,7 @@ public final class AegisFrame extends JFrame {
         task("Opening " + path.getFileName() + "...", () -> Workspace.load(path), w -> {
             workspace = w; mappings = new MappingSet(); selectedEntry = null; source.setText(""); bytecode.setText(""); deobfuscation.setText(""); mappingText.setText("");
             log.setText(w.diagnostics().isEmpty()?"":String.join("\n",w.diagnostics())); fileLabel.setText(path.getFileName().toString()); rebuildTree(); updateButtons();
-            status.setText("Loaded " + w.classes().size() + " classes — parsed by Aegis native classfile core"); runAnalysis();
+            status.setText("Loaded " + w.classes().size() + " classes"); runAnalysis();
         });
     }
 
@@ -167,11 +167,11 @@ public final class AegisFrame extends JFrame {
     private void showClass(String entry) {
         if (workspace == null) return;
         Optional<ClassUnit> o=workspace.classByEntry(entry); if (o.isEmpty()) return; ClassUnit u=o.get();
-        task("Decompiling " + u.simpleName() + " with Aegis Native...", () -> {
+        task("Decompiling " + u.simpleName() + "...", () -> {
             String sourceName=null; try { sourceName=dev.aegis.classfile.DebugMetadata.sourceFile(dev.aegis.classfile.ClassFileParser.parse(u.bytes())); } catch(RuntimeException ignored) {}
             String bundled=workspace.bundledSource(u.internalName(),sourceName).orElse(null);
             String s=decompiler.decompile(u.bytes(),mappings,bundled); String b=BytecodePrinter.print(u.bytes()); String d=deobfuscationInspector.inspect(u.bytes()); return new String[]{s,b,d};
-        }, pair -> { if (Objects.equals(selectedEntry,entry)) { source.setText(pair[0]); source.setCaretPosition(0); bytecode.setText(pair[1]); bytecode.setCaretPosition(0); deobfuscation.setText(pair[2]); deobfuscation.setCaretPosition(0); status.setText("Aegis Native: " + u.binaryName() + " — Java " + u.javaVersion()); }});
+        }, pair -> { if (Objects.equals(selectedEntry,entry)) { source.setText(pair[0]); source.setCaretPosition(0); bytecode.setText(pair[1]); bytecode.setCaretPosition(0); deobfuscation.setText(pair[2]); deobfuscation.setCaretPosition(0); status.setText("Aegis — " + u.binaryName() + " — Java " + u.javaVersion()); }});
     }
 
     private void runAnalysis() {
@@ -188,7 +188,7 @@ public final class AegisFrame extends JFrame {
     private void chooseExport() {
         if (workspace==null) return; JFileChooser c=new JFileChooser(); c.setSelectedFile(new java.io.File("aegis-deobfuscated.jar"));
         if (c.showSaveDialog(this)!=JFileChooser.APPROVE_OPTION) return; Path p=c.getSelectedFile().toPath();
-        task("Running native bytecode cleaner...", () -> { var r = workspace.exportDeobfuscated(p); return new Object[]{p,r}; }, x -> { var r=(dev.aegis.deobfuscate.NativeBytecodeCleaner.CleanResult)x[1]; status.setText("Exported clean JAR: "+r.methodsChanged()+" methods, "+r.instructionsRewritten()+" rewrites"); log.append((log.getText().isEmpty()?"":"\n")+String.join("\n",r.notes())+"\n"); });
+        task("Cleaning bytecode...", () -> { var r = workspace.exportDeobfuscated(p); return new Object[]{p,r}; }, x -> { var r=(dev.aegis.deobfuscate.BytecodeCleaner.CleanResult)x[1]; status.setText("Exported clean JAR: "+r.methodsChanged()+" methods, "+r.instructionsRewritten()+" rewrites"); log.append((log.getText().isEmpty()?"":"\n")+String.join("\n",r.notes())+"\n"); });
     }
 
     private void saveMappings() {
