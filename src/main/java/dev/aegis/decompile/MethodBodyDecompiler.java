@@ -8,7 +8,6 @@ import dev.aegis.rename.SemanticNameEngine;
 import dev.aegis.util.JavaNames;
 import java.util.*;
 
-/** Native structured JVM bytecode -> Java source emitter. */
 final class MethodBodyDecompiler {
     record Result(List<String> lines, boolean complete, boolean hasTerminalReturn) {}
     private record Expr(String text, String type, Object constant, int width, String newType) {
@@ -25,33 +24,34 @@ final class MethodBodyDecompiler {
     }
 
     private final ClassFile cf; private final MemberInfo method; private final CodeAttribute code; private final MappingSet map;
-    private final DeobfuscationResult deobf; private final List<Instruction> insns; private final Map<Integer,Integer> indexByOffset=new HashMap<>();
-    private final LocalVariableTable lvt; private final BootstrapMethods bootstraps; private final ConstantMethodEvaluator constantEvaluator = new ConstantMethodEvaluator();
+    private final DeobfuscationResult deobf; private final List<Instruction> insns; private final Map<Integer,Integer> indexByOffset=new HashMap<>(); private final ControlFlowGraph cfg;
+    private final LocalVariableTable lvt; private final LocalVariableTypeTable lvtt; private final LineNumberTable lineNumbers; private final BootstrapMethods bootstraps; private final ConstantMethodEvaluator constantEvaluator = new ConstantMethodEvaluator();
     private final HashMap<Integer,String> localNames=new HashMap<>(); private final HashMap<Integer,String> localTypes=new HashMap<>();
-    private final HashSet<Integer> parameterSlots=new HashSet<>(); private final ArrayList<String> lines=new ArrayList<>();
+    private final HashSet<Integer> parameterSlots=new HashSet<>(); private final HashSet<String> usedSourceLocalNames=new HashSet<>(); private final Map<Integer,List<String>> sourceLocalNames; private final ArrayList<String> lines=new ArrayList<>();
     private boolean terminalReturn; private boolean complete=true; private int syntheticArrayId;
 
-    private MethodBodyDecompiler(ClassFile cf,MemberInfo method,CodeAttribute code,MappingSet map,List<String> params){
-        this.cf=cf;this.method=method;this.code=code;this.map=map;this.lvt=LocalVariableTable.from(code,cf.constantPool());this.bootstraps=BootstrapMethods.from(cf);
-        this.deobf=new Deobfuscator().analyze(cf,method,code);this.insns=deobf.instructions();for(int i=0;i<insns.size();i++)indexByOffset.put(insns.get(i).offset(),i);
+    private MethodBodyDecompiler(ClassFile cf,MemberInfo method,CodeAttribute code,MappingSet map,List<String> params,Map<Integer,List<String>> sourceLocalNames){
+        this.cf=cf;this.method=method;this.code=code;this.map=map;this.lvt=LocalVariableTable.from(code,cf.constantPool());this.lvtt=LocalVariableTypeTable.from(code,cf.constantPool());this.lineNumbers=LineNumberTable.from(code);this.bootstraps=BootstrapMethods.from(cf);this.sourceLocalNames=sourceLocalNames==null?Map.of():sourceLocalNames;
+        this.deobf=new Deobfuscator().analyze(cf,method,code);this.insns=deobf.instructions();this.cfg=ControlFlowGraph.build(insns,code);for(int i=0;i<insns.size();i++)indexByOffset.put(insns.get(i).offset(),i);
         initLocals(params); inferLocals();
     }
-    static Result decompile(ClassFile cf,MemberInfo method,CodeAttribute code,MappingSet map,List<String> params){return new MethodBodyDecompiler(cf,method,code,map,params).run();}
+    static Result decompile(ClassFile cf,MemberInfo method,CodeAttribute code,MappingSet map,List<String> params,Map<Integer,List<String>> sourceLocalNames){return new MethodBodyDecompiler(cf,method,code,map,params,sourceLocalNames).run();}
 
     private Result run(){
         try {
-            if(deobf.report().totalSimplifications()>0) lines.add("// Aegis deobfuscator: "+deobf.report().compact());
             emitLocalDeclarations();
             State state=new State();
-            if(tryBooleanReturnChain(0,insns.size(),state)) return new Result(List.copyOf(lines),true,true);
+            DescriptorParser.MethodDescriptor descriptor=DescriptorParser.method(method.descriptor());
+            if(tryBooleanReturnChain(0,insns.size(),state)) return new Result(SourcePostProcessor.process(lines,descriptor.returnType()),true,true);
             if(!code.exceptionTable().isEmpty() && tryEmitSimpleExceptionRegion(state)) {
-                return new Result(List.copyOf(lines),complete,terminalReturn);
+                return new Result(SourcePostProcessor.process(lines,descriptor.returnType()),complete,terminalReturn);
             }
             emitRange(0,code.code().length,state,0,new HashSet<>());
-            return new Result(List.copyOf(lines),complete,terminalReturn);
+            return new Result(SourcePostProcessor.process(lines,descriptor.returnType()),complete,terminalReturn);
         } catch(RuntimeException ex){
-            complete=false; lines.add("// Aegis structured emitter recovered from: "+safe(ex.getMessage()));
-            lines.add("// Remaining bytecode is available in the Bytecode tab; no fake return value was inserted here.");
+            complete=false;
+            lines.add("// aegis recovered from "+safe(ex.getMessage()).toLowerCase(Locale.ROOT).replace(".","").replace(",",""));
+            lines.add("// remaining bytecode is available in the bytecode tab");
             return new Result(List.copyOf(lines),false,terminalReturn);
         }
     }
@@ -64,10 +64,24 @@ final class MethodBodyDecompiler {
     private void inferLocals(){
         for(int i=0;i<insns.size();i++){
             Instruction in=insns.get(i);Integer slot=storeSlot(in);if(slot==null||parameterSlots.contains(slot))continue;
-            LocalVariableTable.Local lv=lvt.find(slot,in.offset());if(lv!=null){localNames.putIfAbsent(slot,JavaNames.sanitize(lv.name(),"local"+slot));try{localTypes.putIfAbsent(slot,map.mapJavaType(DescriptorParser.fieldType(lv.descriptor())));}catch(RuntimeException ignored){}}
+            int metadataPc=i+1<insns.size()?insns.get(i+1).offset():in.offset();
+            String recoveredSourceName=sourceLocalName(in.offset());if(recoveredSourceName!=null)localNames.putIfAbsent(slot,recoveredSourceName);
+            LocalVariableTable.Local lv=lvt.find(slot,in.offset());if(lv==null)lv=lvt.find(slot,metadataPc);if(lv!=null){localNames.putIfAbsent(slot,JavaNames.sanitize(lv.name(),"local"+slot));try{localTypes.putIfAbsent(slot,map.mapJavaType(DescriptorParser.fieldType(lv.descriptor())));}catch(RuntimeException ignored){}}
+            LocalVariableTypeTable.LocalType gt=lvtt.find(slot,in.offset());if(gt==null)gt=lvtt.find(slot,metadataPc);if(gt!=null){String generic=GenericSignatureParser.fieldType(gt.signature(),map);if(generic!=null&&!generic.isBlank())localTypes.put(slot,generic);}
             localNames.putIfAbsent(slot,"local"+slot);localTypes.putIfAbsent(slot,inferStoreType(i,in));
         }
     }
+    private String sourceLocalName(int pc){
+        int line=lineNumbers.lineAt(pc);if(line<0)return null;
+        List<String> candidates=sourceLocalNames.get(line);if(candidates==null||candidates.isEmpty())return null;
+        for(String candidate:candidates){
+            String name=JavaNames.sanitize(candidate,"local");
+            if(localNames.containsValue(name)||usedSourceLocalNames.contains(name))continue;
+            usedSourceLocalNames.add(name);return name;
+        }
+        return null;
+    }
+
     private String inferStoreType(int index,Instruction store){
         int op=store.opcode();if((op>=54&&op<=54)||(op>=59&&op<=62))return "int";if(op==55||(op>=63&&op<=66))return "long";if(op==56||(op>=67&&op<=70))return "float";if(op==57||(op>=71&&op<=74))return "double";
         if(index>0){Instruction p=insns.get(index-1);try{return switch(p.opcode()){
@@ -107,10 +121,10 @@ final class MethodBodyDecompiler {
                         if(join>target){
                             Expr ternary=tryPureTernary(i+1,insns.get(gotoBefore).offset(),target,join,state,branchCond);
                             if(ternary!=null){state.push(ternary);i=indexOf(join);continue;}
-                            add(depth,"if ("+negate(branchCond.text())+") {");State a=state.copy();emitRange(i+1,insns.get(gotoBefore).offset(),a,depth+1,activeLoops);add(depth,"} else {");State b=state.copy();emitRange(indexOf(target),join,b,depth+1,activeLoops);add(depth,"}");mergeStacks(state,a,b);i=indexOf(join);continue;
+                            add(depth,"if ("+negate(branchCond.text())+") {");State a=state.copy();emitRange(i+1,insns.get(gotoBefore).offset(),a,depth+1,activeLoops);add(depth,"} else {");State b=state.copy();emitRange(indexOf(target),join,b,depth+1,activeLoops);add(depth,"}");mergeStacks(state,a,b,branchCond);i=indexOf(join);continue;
                         }
                     }
-                    add(depth,"if ("+negate(branchCond.text())+") {");State body=state.copy();emitRange(i+1,target,body,depth+1,activeLoops);add(depth,"}");mergeStacksConservative(state,body);i=indexOf(target);continue;
+                    add(depth,"if ("+negate(branchCond.text())+") {");State body=state.copy();emitRange(i+1,target,body,depth+1,activeLoops);add(depth,"}");mergeStacksConservative(state,body,branchCond);i=indexOf(target);continue;
                 } else {
                     add(depth,"if ("+branchCond.text()+") { continue; }");i++;continue;
                 }
@@ -121,7 +135,7 @@ final class MethodBodyDecompiler {
             if(in.opcode()==170||in.opcode()==171){Integer forcedSwitch=deobf.forcedSwitchTarget(in.offset());if(forcedSwitch!=null){state.pop();i=indexOf(forcedSwitch);continue;}i=emitSwitch(i,endOffset,state,depth,activeLoops);continue;}
             int before=lines.size();emitLinear(in,state,depth);
             if(ControlFlowGraph.isTerminal(in.opcode())){if(depth==0)terminalReturn=true;return i+1;}
-            if(lines.size()==before&&in.opcode()==169){complete=false;add(depth,"// legacy ret bytecode not representable directly in Java source");}
+            if(lines.size()==before&&in.opcode()==169){complete=false;add(depth,"// legacy ret bytecode not representable directly in java source");}
             i++;
         }return i;
     }
@@ -166,7 +180,13 @@ final class MethodBodyDecompiler {
         for(int s=0;s<starts.size();s++){int off=starts.get(s);for(String label:labels.get(off))add(depth+1,label);int regionEnd=s+1<starts.size()?starts.get(s+1):join;State cs=state.copy();emitRange(indexOf(off),regionEnd,cs,depth+2,activeLoops);Instruction last=lastLiveBefore(regionEnd);if(last==null||(!ControlFlowGraph.isTerminal(last.opcode())&&!ControlFlowGraph.isGoto(last.opcode())))add(depth+2,"break;");}
         add(depth,"}");return join<code.code().length?indexOf(join):indexOf(endOffset);
     }
-    private int findSwitchJoin(List<Integer> starts,int endOffset){int best=endOffset;for(int s:starts){for(int i=indexOf(s);i<insns.size()&&insns.get(i).offset()<endOffset;i++){Instruction x=insns.get(i);if(ControlFlowGraph.isGoto(x.opcode())&&x.branchTargets().length>0&&x.branchTargets()[0]>Collections.max(starts))best=Math.min(best,x.branchTargets()[0]);if(i+1<insns.size()&&starts.contains(insns.get(i+1).offset()))break;}}return best;}
+    private int findSwitchJoin(List<Integer> starts,int endOffset){
+        if(!starts.isEmpty()){
+            int switchIndex=previousLiveIndex(Collections.min(starts));
+            if(switchIndex>=0){ControlFlowGraph.BasicBlock block=cfg.blockContaining(insns.get(switchIndex).offset());ControlFlowGraph.BasicBlock post=block==null?null:cfg.immediatePostDominator(block);if(post!=null&&post.startOffset()>insns.get(switchIndex).offset()&&post.startOffset()<=endOffset)return post.startOffset();}
+        }
+        int best=endOffset;for(int s:starts){for(int i=indexOf(s);i<insns.size()&&insns.get(i).offset()<endOffset;i++){Instruction x=insns.get(i);if(ControlFlowGraph.isGoto(x.opcode())&&x.branchTargets().length>0&&x.branchTargets()[0]>Collections.max(starts))best=Math.min(best,x.branchTargets()[0]);if(i+1<insns.size()&&starts.contains(insns.get(i+1).offset()))break;}}return best;
+    }
 
     private Expr tryPureTernary(int thenStart,int thenEndOffset,int elseStartOffset,int join,State base,Expr branchCond){
         State a=base.copy(),b=base.copy();int la=lines.size();if(!simulatePure(thenStart,thenEndOffset,a))return null;if(!simulatePure(indexOf(elseStartOffset),join,b))return null;if(lines.size()!=la){while(lines.size()>la)lines.remove(lines.size()-1);return null;}if(a.stack.size()!=base.stack.size()+1||b.stack.size()!=base.stack.size()+1)return null;Expr x=a.pop(),y=b.pop();String t=commonType(x.type(),y.type());return Expr.of("("+negate(branchCond.text())+" ? "+x.text()+" : "+y.text()+")",t);
@@ -194,7 +214,7 @@ final class MethodBodyDecompiler {
         case 133 -> cast(s,"long");case 134 -> cast(s,"float");case 135 -> cast(s,"double");case 136 -> cast(s,"int");case 137 -> cast(s,"float");case 138 -> cast(s,"double");case 139 -> cast(s,"int");case 140 -> cast(s,"long");case 141 -> cast(s,"double");case 142 -> cast(s,"int");case 143 -> cast(s,"long");case 144 -> cast(s,"float");case 145 -> cast(s,"byte");case 146 -> cast(s,"char");case 147 -> cast(s,"short");
         case 148 -> compare(s,"Long.compare");case 149,150 -> compare(s,"Float.compare");case 151,152 -> compare(s,"Double.compare");
         case 169 -> {complete=false;add(depth,"// ret "+i.u1(0)+" (legacy jsr/ret)");}
-        case 172,173,174,175,176 -> {add(depth,"return "+s.pop().text()+";");terminalReturn=true;} case 177 -> {if(!"<clinit>".equals(method.name()))add(depth,"return;");terminalReturn=true;}
+        case 172 -> {Expr value=s.pop();String ret=DescriptorParser.method(method.descriptor()).returnType();add(depth,"return "+("boolean".equals(ret)?booleanReturn(value):value.text())+";");terminalReturn=true;} case 173,174,175,176 -> {add(depth,"return "+s.pop().text()+";");terminalReturn=true;} case 177 -> {if(!"<clinit>".equals(method.name()))add(depth,"return;");terminalReturn=true;}
         case 178 -> getStatic(i.u2(0),s);case 179 -> putStatic(i.u2(0),s,depth);case 180 -> getField(i.u2(0),s);case 181 -> putField(i.u2(0),s,depth);
         case 182,183,184,185 -> invoke(op,i.u2(0),s,depth);case 186 -> invokeDynamic(i.u2(0),s,depth);
         case 187 -> s.push(Expr.fresh(SourceDecompiler.javaClass(cf.constantPool().className(i.u2(0)),map)));case 188 -> {Expr n=s.pop();s.push(Expr.of("new "+primitiveArrayType(i.u1(0))+"["+n.text()+"]",primitiveArrayType(i.u1(0))+"[]"));}case 189 -> {Expr n=s.pop();String t=SourceDecompiler.javaClass(cf.constantPool().className(i.u2(0)),map);s.push(Expr.of("new "+t+"["+n.text()+"]",t+"[]"));}
@@ -203,11 +223,13 @@ final class MethodBodyDecompiler {
         default -> {complete=false;add(depth,"// unsupported opcode "+i.mnemonic()+" @"+i.offset());}
     }}
 
+    private String booleanReturn(Expr value){if(value.constant() instanceof Number n)return n.intValue()==0?"false":"true";if("boolean".equals(value.type()))return value.text();return "("+value.text()+" != 0)";}
+
     private Expr branchCondition(Instruction i,State s){int op=i.opcode();if(op>=153&&op<=158){Expr a=s.pop();if("boolean".equals(a.type()))return Expr.of(switch(op){case 153->negate(a.text());case 154->paren(a.text());default->paren(a.text())+comparisonZero(op);},"boolean");return Expr.of(paren(a.text())+comparisonZero(op),"boolean");}if(op>=159&&op<=166){Expr b=s.pop(),a=s.pop();String cmp=switch(op){case 159,165->" == ";case 160,166->" != ";case 161->" < ";case 162->" >= ";case 163->" > ";default->" <= ";};return Expr.of("("+a.text()+cmp+b.text()+")","boolean");}if(op==198||op==199){Expr a=s.pop();return Expr.of("("+a.text()+(op==198?" == null":" != null")+")","boolean");}return Expr.of("true /* branch */","boolean");}
     private static String comparisonZero(int op){return switch(op){case 153->" == 0";case 154->" != 0";case 155->" < 0";case 156->" >= 0";case 157->" > 0";default->" <= 0";};}
 
     private void getStatic(int cp,State s){ConstantPool.MemberRef r=cf.constantPool().memberRef(cp);String t=map.mapJavaType(DescriptorParser.fieldType(r.descriptor()));s.push(Expr.of(staticOwner(r.owner())+"."+fieldName(r),t));}
-    private void putStatic(int cp,State s,int depth){ConstantPool.MemberRef r=cf.constantPool().memberRef(cp);add(depth,staticOwner(r.owner())+"."+fieldName(r)+" = "+s.pop().text()+";");}
+    private void putStatic(int cp,State s,int depth){ConstantPool.MemberRef r=cf.constantPool().memberRef(cp);String owner=r.owner().equals(cf.thisClass())&&"<clinit>".equals(method.name())?"":staticOwner(r.owner())+".";add(depth,owner+fieldName(r)+" = "+s.pop().text()+";");}
     private void getField(int cp,State s){ConstantPool.MemberRef r=cf.constantPool().memberRef(cp);Expr o=s.pop();s.push(Expr.of(o.text()+"."+fieldName(r),map.mapJavaType(DescriptorParser.fieldType(r.descriptor()))));}
     private void putField(int cp,State s,int depth){ConstantPool.MemberRef r=cf.constantPool().memberRef(cp);Expr v=s.pop(),o=s.pop();add(depth,o.text()+"."+fieldName(r)+" = "+v.text()+";");}
     private String fieldName(ConstantPool.MemberRef r){return JavaNames.sanitize(map.fieldName(r.owner(),r.name(),r.descriptor()),"field");}
@@ -286,8 +308,8 @@ final class MethodBodyDecompiler {
     private int threadedTarget(Instruction i){return deobf.threadedTarget(i.offset(),i.branchTargets().length==0?i.offset()+i.length():i.branchTargets()[0]);}
     private int indexOf(int offset){Integer i=indexByOffset.get(offset);if(i!=null)return i;int p=Collections.binarySearch(insns,new Instruction(offset,0,"",new byte[0],0,new int[0]),Comparator.comparingInt(Instruction::offset));return p>=0?p:Math.min(insns.size(),-p-1);}
 
-    private static void mergeStacks(State dst,State a,State b){dst.stack.clear();if(a.stack.size()!=b.stack.size())return;for(int i=0;i<a.stack.size();i++){Expr x=a.stack.get(i),y=b.stack.get(i);dst.stack.add(Objects.equals(x.text(),y.text())?x:Expr.of("/* phi */ ("+x.text()+")",commonType(x.type(),y.type())));}}
-    private static void mergeStacksConservative(State dst,State branch){if(dst.stack.size()!=branch.stack.size())return;for(int i=0;i<dst.stack.size();i++)if(!Objects.equals(dst.stack.get(i).text(),branch.stack.get(i).text()))dst.stack.set(i,Expr.of("/* phi */ "+dst.stack.get(i).text(),commonType(dst.stack.get(i).type(),branch.stack.get(i).type())));}
+    private void mergeStacks(State dst,State a,State b,Expr branchCond){dst.stack.clear();if(a.stack.size()!=b.stack.size())return;for(int i=0;i<a.stack.size();i++){Expr x=a.stack.get(i),y=b.stack.get(i);if(Objects.equals(x.text(),y.text()))dst.stack.add(x);else dst.stack.add(Expr.of("("+negate(branchCond.text())+" ? "+x.text()+" : "+y.text()+")",commonType(x.type(),y.type())));}}
+    private void mergeStacksConservative(State dst,State branch,Expr branchCond){if(dst.stack.size()!=branch.stack.size())return;for(int i=0;i<dst.stack.size();i++){Expr original=dst.stack.get(i),changed=branch.stack.get(i);if(!Objects.equals(original.text(),changed.text()))dst.stack.set(i,Expr.of("("+negate(branchCond.text())+" ? "+changed.text()+" : "+original.text()+")",commonType(original.type(),changed.type())));}}
     private static String commonType(String a,String b){return Objects.equals(a,b)?a:"java.lang.Object";}
 
     private void dup(State s,int depth){
@@ -303,7 +325,7 @@ final class MethodBodyDecompiler {
     private static String primitiveArrayType(int a){return switch(a){case 4->"boolean";case 5->"char";case 6->"float";case 7->"double";case 8->"byte";case 9->"short";case 10->"int";case 11->"long";default->"java.lang.Object";};}private static String arrayComponent(String t){return t!=null&&t.endsWith("[]")?t.substring(0,t.length()-2):"java.lang.Object";}
     private String staticOwner(String internal){String j=SourceDecompiler.javaClass(internal,map);if(internal.equals(cf.thisClass())){int dot=j.lastIndexOf('.');return dot<0?j:j.substring(dot+1);}return j;}
     private static boolean isSideEffect(String x){return x.contains("(")||x.contains("=")||x.startsWith("new ");}
-    private void add(int depth,String text){lines.add("    ".repeat(Math.max(0,depth))+text);}private String paren(String s){return s.startsWith("(")&&s.endsWith(")")?s:"("+s+")";}private String negate(String s){String x=s.trim();if(x.startsWith("!")&&!x.startsWith("!=("))return x.substring(1);if(x.contains(" == "))return x.replace(" == "," != ");if(x.contains(" != "))return x.replace(" != "," == ");if(x.contains(" >= "))return x.replace(" >= "," < ");if(x.contains(" <= "))return x.replace(" <= "," > ");if(x.contains(" > "))return x.replace(" > "," <= ");if(x.contains(" < "))return x.replace(" < "," >= ");return "!("+x+")";}
+    private void add(int depth,String text){lines.add("    ".repeat(Math.max(0,depth))+text);}private String paren(String s){String x=s.trim();if(hasOuterParens(x))return x;if(x.contains(" == ")||x.contains(" != ")||x.contains(" >= ")||x.contains(" <= ")||x.contains(" > ")||x.contains(" < ")||x.contains(" && ")||x.contains(" || "))return "("+x+")";return x;}private String negate(String s){String x=stripOuterParens(s.trim());if(x.startsWith("!")&&!x.startsWith("!=("))return stripOuterParens(x.substring(1));if(x.contains(" == "))return paren(x.replace(" == "," != "));if(x.contains(" != "))return paren(x.replace(" != "," == "));if(x.contains(" >= "))return paren(x.replace(" >= "," < "));if(x.contains(" <= "))return paren(x.replace(" <= "," > "));if(x.contains(" > "))return paren(x.replace(" > "," <= "));if(x.contains(" < "))return paren(x.replace(" < "," >= "));return "!"+paren(x);}private static String stripOuterParens(String s){String x=s;while(hasOuterParens(x))x=x.substring(1,x.length()-1).trim();return x;}private static boolean hasOuterParens(String s){if(s.length()<2||s.charAt(0)!='('||s.charAt(s.length()-1)!=')')return false;int d=0;for(int i=0;i<s.length();i++){char c=s.charAt(i);if(c=='(')d++;else if(c==')'){d--;if(d==0&&i<s.length()-1)return false;}}return d==0;}
     private static String safe(String s){return s==null?"unknown":s.replace('\n',' ').replace('\r',' ');}
     private static boolean isAStore(Instruction i){int op=i.opcode();return op==58||(op>=75&&op<=78)||(op==196&&i.operands().length>0&&i.u1(0)==58);}private static Integer storeSlot(Instruction i){int op=i.opcode();if(op>=54&&op<=58)return i.u1(0);if(op>=59&&op<=62)return op-59;if(op>=63&&op<=66)return op-63;if(op>=67&&op<=70)return op-67;if(op>=71&&op<=74)return op-71;if(op>=75&&op<=78)return op-75;if(op==196&&i.operands().length>=3&&i.u1(0)>=54&&i.u1(0)<=58)return i.u2(1);return null;}
 
