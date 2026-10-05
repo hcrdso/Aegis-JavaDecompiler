@@ -96,10 +96,33 @@ public final class MappingSet {
         return b.toString();
     }
 
+    public String toJson() {
+        StringBuilder b=new StringBuilder("{\n  \"format\": \"aegis-mappings-v1\",\n");
+        b.append("  \"classes\": [\n"); int n=0;
+        for(var e:classDecisions.entrySet()){if(n++>0)b.append(",\n");appendJsonDecision(b,"    ",e.getKey(),null,null,e.getValue());} b.append("\n  ],\n");
+        b.append("  \"fields\": [\n"); n=0;
+        for(var e:fieldDecisions.entrySet()){if(n++>0)b.append(",\n");MemberKey k=e.getKey();appendJsonDecision(b,"    ",k.owner(),k.name(),k.descriptor(),e.getValue());} b.append("\n  ],\n");
+        b.append("  \"methods\": [\n"); n=0;
+        for(var e:methodDecisions.entrySet()){if(n++>0)b.append(",\n");MemberKey k=e.getKey();appendJsonDecision(b,"    ",k.owner(),k.name(),k.descriptor(),e.getValue());} b.append("\n  ]\n}\n");
+        return b.toString();
+    }
+
+    private static void appendJsonDecision(StringBuilder b,String indent,String owner,String name,String descriptor,Decision d){
+        b.append(indent).append("{\"owner\":\"").append(json(owner)).append("\"");
+        if(name!=null)b.append(",\"name\":\"").append(json(name)).append("\"");
+        if(descriptor!=null)b.append(",\"descriptor\":\"").append(json(descriptor)).append("\"");
+        b.append(",\"target\":\"").append(json(d.target())).append("\",\"confidence\":").append(d.confidence())
+                .append(",\"reason\":\"").append(json(d.reason())).append("\"}");
+    }
+    private static String json(String s){return s==null?"":s.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","\\r").replace("\t","\\t");}
+
     public String summary() {
         StringBuilder b = new StringBuilder();
         b.append("Aegis semantic rename plan\n\nClasses: ").append(classDecisions.size())
-                .append("\nFields: ").append(fieldDecisions.size()).append("\nMethods: ").append(methodDecisions.size()).append("\n\n");
+                .append("\nFields: ").append(fieldDecisions.size()).append("\nMethods: ").append(methodDecisions.size()).append('\n');
+        int high=0,medium=0,low=0; ArrayList<Decision> all=new ArrayList<>(); all.addAll(classDecisions.values());all.addAll(fieldDecisions.values());all.addAll(methodDecisions.values());
+        for(Decision d:all){if(d.confidence()>=85)high++;else if(d.confidence()>=60)medium++;else low++;}
+        b.append("Confidence: ").append(high).append(" high / ").append(medium).append(" medium / ").append(low).append(" low\n\n");
         if (!classDecisions.isEmpty()) {
             b.append("[Classes]\n");
             classDecisions.forEach((k,d) -> b.append(k).append(" -> ").append(d.target()).append("  [").append(d.confidence()).append("%] ").append(d.reason()).append('\n'));
