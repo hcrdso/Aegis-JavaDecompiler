@@ -8,11 +8,14 @@ public final class Deobfuscator {
     private static final Object UNKNOWN = new Object();
     private static final Object NULL = new Object();
     private static final Object NON_NULL = new Object();
+    private static final Object NON_ZERO = new Object();
+    private record Symbol(String id) {}
 
     public DeobfuscationResult analyze(ClassFile cf, MemberInfo method, CodeAttribute code) {
         List<Instruction> insns = BytecodeDecoder.decode(code.code());
         ControlFlowGraph cfg = ControlFlowGraph.build(insns, code);
-        BranchFacts facts = constantBranchAnalysis(cf, method, code, cfg);
+        Map<FieldKey,Object> staticValues = collectStaticFieldConstants(cf);
+        BranchFacts facts = constantBranchAnalysis(cf, method, code, cfg, staticValues);
         Map<Integer, Boolean> forced = facts.conditionals();
         Map<Integer, Integer> forcedSwitches = facts.switchTargets();
         Set<Integer> unreachable = unreachableWithForced(cfg, forced, forcedSwitches);
@@ -37,6 +40,8 @@ public final class Deobfuscator {
         if (!threaded.isEmpty()) notes.add("Threaded " + threaded.size() + " goto chain(s)");
         if (!deadStores.isEmpty()) notes.add("Detected " + deadStores.size() + " dead local store(s)");
         if (!cfg.naturalLoops().isEmpty()) notes.add("Detected " + cfg.naturalLoops().size() + " natural loop(s) using dominators");
+        if (cfg.hasIrreducibleRegion()) notes.add("Detected " + cfg.irreducibleRegions().size() + " irreducible control flow region(s)");
+        if (!staticValues.isEmpty()) notes.add("Recovered " + staticValues.size() + " static constant value(s)");
         DeobfuscationReport report = new DeobfuscationReport(unreachable.size(), forced.size() + forcedSwitches.size(), redundant,
                 folds, deadStores.size(), nops, List.copyOf(notes));
         return new DeobfuscationResult(insns, Set.copyOf(unreachable), Map.copyOf(forced), Map.copyOf(forcedSwitches), Map.copyOf(threaded),
@@ -44,8 +49,9 @@ public final class Deobfuscator {
     }
 
     private record BranchFacts(Map<Integer,Boolean> conditionals, Map<Integer,Integer> switchTargets) {}
+    private record FieldKey(String owner,String name,String descriptor) {}
 
-    private BranchFacts constantBranchAnalysis(ClassFile cf, MemberInfo method, CodeAttribute code, ControlFlowGraph cfg) {
+    private BranchFacts constantBranchAnalysis(ClassFile cf, MemberInfo method, CodeAttribute code, ControlFlowGraph cfg, Map<FieldKey,Object> staticValues) {
         if (cfg.entry() == null) return new BranchFacts(Map.of(), Map.of());
         Map<ControlFlowGraph.BasicBlock, Frame> entries = new HashMap<>();
         ArrayDeque<ControlFlowGraph.BasicBlock> work = new ArrayDeque<>();
@@ -66,9 +72,10 @@ public final class Deobfuscator {
                     consumeConditional(in.opcode(), f);
                 } else if (in.opcode() == 170 || in.opcode() == 171) {
                     Object key = f.pop();
-                    Integer target = evaluateSwitchTarget(in, key);
+                    Integer target = effectiveSwitchTarget(in);
+                    if (target == null) target = evaluateSwitchTarget(in, key);
                     if (target != null) forcedSwitches.put(in.offset(), target);
-                } else transfer(cf, in, f, evaluator);
+                } else transfer(cf, in, f, evaluator, staticValues, false);
             }
             if (last == null) continue;
             if (ControlFlowGraph.isConditional(last.opcode()) && last.branchTargets().length > 0) {
@@ -115,14 +122,14 @@ public final class Deobfuscator {
         DescriptorParser.MethodDescriptor md;
         try { md = DescriptorParser.method(method.descriptor()); } catch (RuntimeException ex) { return f; }
         int slot = 0;
-        if (!AccessFlags.has(method.accessFlags(), AccessFlags.STATIC)) f.locals[slot++] = UNKNOWN;
+        if (!AccessFlags.has(method.accessFlags(), AccessFlags.STATIC)) f.locals[slot++] = NON_NULL;
         for (int i = 0; i < md.parameterTypes().size(); i++) {
-            f.locals[slot] = UNKNOWN; slot += md.slotWidths().get(i);
+            f.locals[slot] = new Symbol("p" + i); slot += md.slotWidths().get(i);
         }
         return f;
     }
 
-    private static void transfer(ClassFile cf, Instruction in, Frame f, ConstantMethodEvaluator evaluator) {
+    private static void transfer(ClassFile cf, Instruction in, Frame f, ConstantMethodEvaluator evaluator, Map<FieldKey,Object> staticValues, boolean collectStaticWrites) {
         int op = in.opcode();
         try {
             switch (op) {
@@ -176,8 +183,14 @@ public final class Deobfuscator {
                 case 133,134,135,136,137,138,139,140,141,142,143,144,145,146,147 -> convert(op, f);
                 case 148,149,150,151,152 -> compare(op, f);
                 case 167,168,169,170,171,172,173,174,175,176,177,191,198,199,200,201 -> { /* handled by CFG/condition */ }
-                case 178 -> f.push(staticFieldConstant(cf, in));
-                case 179 -> f.pop();
+                case 178 -> f.push(staticFieldConstant(cf, in, staticValues));
+                case 179 -> {
+                    Object value=f.pop();
+                    if(collectStaticWrites&&isKnownConstant(value)){
+                        ConstantPool.MemberRef ref=cf.constantPool().memberRef(in.u2(0));
+                        if(ref.owner().equals(cf.thisClass())&&isStaticFinalField(cf,ref.name(),ref.descriptor()))staticValues.put(new FieldKey(ref.owner(),ref.name(),ref.descriptor()),value);
+                    }
+                }
                 case 180 -> { f.pop(); f.push(UNKNOWN); }
                 case 181 -> { f.pop(); f.pop(); }
                 case 182,183,184,185 -> invoke(cf, in, f, op, evaluator);
@@ -248,12 +261,12 @@ public final class Deobfuscator {
                     default -> UNKNOWN;
                 };
             }
-            if("java/lang/String".equals(r.owner()) && r.name().equals("valueOf") && args.size()==1 && args.get(0)!=UNKNOWN && args.get(0)!=NULL && args.get(0)!=NON_NULL)
-                return String.valueOf(args.get(0));
+            if("java/lang/String".equals(r.owner()) && r.name().equals("valueOf") && args.size()==1 && isConcreteConstant(args.get(0)))
+                return String.valueOf(args.get(0)==NULL?null:args.get(0));
             if("java/util/Objects".equals(r.owner())){
                 if(r.name().equals("equals")&&args.size()==2&&args.get(0)!=UNKNOWN&&args.get(1)!=UNKNOWN&&args.get(0)!=NON_NULL&&args.get(1)!=NON_NULL)return Objects.equals(args.get(0),args.get(1))?1:0;
-                if(r.name().equals("isNull")&&args.size()==1&&args.get(0)!=UNKNOWN)return args.get(0)==NULL?1:0;
-                if(r.name().equals("nonNull")&&args.size()==1&&args.get(0)!=UNKNOWN)return args.get(0)==NULL?0:1;
+                if(r.name().equals("isNull")&&args.size()==1&&(args.get(0)==NULL||args.get(0)==NON_NULL))return args.get(0)==NULL?1:0;
+                if(r.name().equals("nonNull")&&args.size()==1&&(args.get(0)==NULL||args.get(0)==NON_NULL))return args.get(0)==NULL?0:1;
             }
             if("java/lang/Integer".equals(r.owner())){
                 if(r.name().equals("compare")&&args.size()==2)return Integer.compare(((Number)args.get(0)).intValue(),((Number)args.get(1)).intValue());
@@ -285,9 +298,11 @@ public final class Deobfuscator {
         return UNKNOWN;
     }
 
-    private static Object staticFieldConstant(ClassFile cf,Instruction in){
+    private static Object staticFieldConstant(ClassFile cf,Instruction in,Map<FieldKey,Object> staticValues){
         try{
             ConstantPool.MemberRef r=cf.constantPool().memberRef(in.u2(0));
+            Object known=staticValues.get(new FieldKey(r.owner(),r.name(),r.descriptor()));
+            if(known!=null)return known;
             if(!r.owner().equals(cf.thisClass()))return UNKNOWN;
             for(MemberInfo f:cf.fields())if(f.name().equals(r.name())&&f.descriptor().equals(r.descriptor())
                     &&AccessFlags.has(f.accessFlags(),AccessFlags.STATIC)&&AccessFlags.has(f.accessFlags(),AccessFlags.FINAL)){
@@ -297,6 +312,52 @@ public final class Deobfuscator {
             }
         }catch(RuntimeException ignored){}
         return UNKNOWN;
+    }
+
+    private Map<FieldKey,Object> collectStaticFieldConstants(ClassFile cf){
+        LinkedHashMap<FieldKey,Object> values=new LinkedHashMap<>();
+        for(MemberInfo field:cf.fields()){
+            if(!AccessFlags.has(field.accessFlags(),AccessFlags.STATIC)||!AccessFlags.has(field.accessFlags(),AccessFlags.FINAL))continue;
+            AttributeInfo cv=field.attribute("ConstantValue");
+            if(cv==null||cv.data().length!=2)continue;
+            try{
+                Object value=cf.constantPool().constant(cv.reader().u2());
+                if(isKnownConstant(value))values.put(new FieldKey(cf.thisClass(),field.name(),field.descriptor()),value);
+            }catch(RuntimeException ignored){}
+        }
+        MemberInfo clinit=null;
+        for(MemberInfo method:cf.methods())if(method.name().equals("<clinit>")&&method.descriptor().equals("()V")){clinit=method;break;}
+        if(clinit==null)return Map.copyOf(values);
+        AttributeInfo ca=clinit.attribute("Code");
+        if(ca==null)return Map.copyOf(values);
+        try{
+            CodeAttribute code=CodeAttribute.parse(ca,cf.constantPool());
+            Frame frame=new Frame(Math.max(1,code.maxLocals()));
+            ConstantMethodEvaluator evaluator=new ConstantMethodEvaluator();
+            int steps=0;
+            for(Instruction in:BytecodeDecoder.decode(code.code())){
+                if(++steps>4000)break;
+                int op=in.opcode();
+                if(ControlFlowGraph.isConditional(op)||ControlFlowGraph.isGoto(op)||op==170||op==171||op==168||op==169||op==200||op==201)break;
+                if(op==177)break;
+                transfer(cf,in,frame,evaluator,values,true);
+            }
+        }catch(RuntimeException ignored){}
+        return Map.copyOf(values);
+    }
+
+    private static boolean isKnownConstant(Object value){
+        return value==NULL||value instanceof Number||value instanceof String;
+    }
+
+    private static boolean isConcreteConstant(Object value){
+        return value==NULL||value instanceof Number||value instanceof String;
+    }
+
+    private static boolean isStaticFinalField(ClassFile cf,String name,String descriptor){
+        for(MemberInfo field:cf.fields())if(field.name().equals(name)&&field.descriptor().equals(descriptor))
+            return AccessFlags.has(field.accessFlags(),AccessFlags.STATIC)&&AccessFlags.has(field.accessFlags(),AccessFlags.FINAL);
+        return false;
     }
     private static void invokeDynamic(ClassFile cf, Instruction in, Frame f) {
         ConstantPool.DynamicRef r=cf.constantPool().dynamicRef(in.u2(0));
@@ -308,11 +369,15 @@ public final class Deobfuscator {
     private static Boolean evaluateConditional(int op, Frame f) {
         try {
             if (op >= 153 && op <= 158) {
-                Object a=f.peek(); if (!(a instanceof Number n)) return null; long x=n.longValue();
+                Object a=f.peek();
+                if(a==NON_ZERO)return op==154;
+                if (!(a instanceof Number n)) return null; long x=n.longValue();
                 return switch(op){case 153->x==0; case 154->x!=0; case 155->x<0; case 156->x>=0; case 157->x>0; default->x<=0;};
             }
             if (op >= 159 && op <= 164) {
-                Object b=f.peek(0), a=f.peek(1); if (!(a instanceof Number x) || !(b instanceof Number y)) return null;
+                Object b=f.peek(0), a=f.peek(1);
+                if(a!=UNKNOWN&&Frame.eq(a,b))return switch(op){case 159,162,164->true;case 160,161,163->false;default->false;};
+                if (!(a instanceof Number x) || !(b instanceof Number y)) return null;
                 long av=x.longValue(), bv=y.longValue();
                 return switch(op){case 159->av==bv; case 160->av!=bv; case 161->av<bv; case 162->av>=bv; case 163->av>bv; default->av<=bv;};
             }
@@ -330,6 +395,14 @@ public final class Deobfuscator {
     private static void consumeConditional(int op, Frame f) {
         if (op >= 159 && op <= 166) { f.pop(); f.pop(); }
         else f.pop();
+    }
+
+    private static Integer effectiveSwitchTarget(Instruction in){
+        int[] targets=in.branchTargets();
+        if(targets.length==0)return null;
+        int first=targets[0];
+        for(int target:targets)if(target!=first)return null;
+        return first;
     }
 
     private static Integer evaluateSwitchTarget(Instruction in,Object key){
@@ -437,7 +510,14 @@ public final class Deobfuscator {
     private static boolean isArithmetic(int op){return op>=96&&op<=152;}
 
     private static void arithmetic(Frame f, char op) {
-        Object b=f.pop(), a=f.pop(); if(!(a instanceof Number x)||!(b instanceof Number y)){f.push(UNKNOWN);return;}
+        Object b=f.pop(), a=f.pop();
+        if(a!=UNKNOWN&&Frame.eq(a,b)&&(op=='^'||op=='-')){f.push(0);return;}
+        if(isZero(b)){if(op=='+'||op=='-'||op=='|'||op=='^'||op=='<'||op=='>'||op=='u'){f.push(a);return;}if(op=='&'||op=='*'){f.push(0);return;}}
+        if(isZero(a)){if(op=='+'||op=='|'||op=='^'){f.push(b);return;}if(op=='&'||op=='*'){f.push(0);return;}}
+        if((op=='|'&&isMinusOne(a))||(op=='|'&&isMinusOne(b))){f.push(-1);return;}
+        if(op=='%'&&isOne(b)){f.push(0);return;}
+        if(op=='|'&&((a instanceof Number x&&x.longValue()!=0)||(b instanceof Number y&&y.longValue()!=0))){f.push(NON_ZERO);return;}
+        if(!(a instanceof Number x)||!(b instanceof Number y)){f.push(UNKNOWN);return;}
         try {
             if(a instanceof Double||b instanceof Double){double p=x.doubleValue(),q=y.doubleValue();f.push(switch(op){case '+'->p+q;case '-'->p-q;case '*'->p*q;case '/'->p/q;case '%'->p%q;default->UNKNOWN;});return;}
             if(a instanceof Float||b instanceof Float){float p=x.floatValue(),q=y.floatValue();f.push(switch(op){case '+'->p+q;case '-'->p-q;case '*'->p*q;case '/'->p/q;case '%'->p%q;default->UNKNOWN;});return;}
@@ -445,6 +525,10 @@ public final class Deobfuscator {
             f.push((a instanceof Integer&&b instanceof Integer&&r instanceof Long l)?l.intValue():r);
         } catch(RuntimeException ex){f.push(UNKNOWN);}
     }
+
+    private static boolean isZero(Object value){return value instanceof Number n&&n.doubleValue()==0d;}
+    private static boolean isOne(Object value){return value instanceof Number n&&n.doubleValue()==1d;}
+    private static boolean isMinusOne(Object value){return value instanceof Number n&&n.longValue()==-1L;}
     private static void unaryNeg(Frame f){Object a=f.pop();if(a instanceof Integer x)f.push(-x);else if(a instanceof Long x)f.push(-x);else if(a instanceof Float x)f.push(-x);else if(a instanceof Double x)f.push(-x);else f.push(UNKNOWN);}
     private static void convert(int op,Frame f){Object a=f.pop();if(!(a instanceof Number n)){f.push(UNKNOWN);return;}f.push(switch(op){case 133,140,143->n.longValue();case 134,137,144->n.floatValue();case 135,138,141->n.doubleValue();case 136,139,142,145,146,147->n.intValue();default->UNKNOWN;});}
     private static void compare(int op,Frame f){Object b=f.pop(),a=f.pop();if(!(a instanceof Number x)||!(b instanceof Number y)){f.push(UNKNOWN);return;}double p=x.doubleValue(),q=y.doubleValue();f.push(Double.compare(p,q));}
