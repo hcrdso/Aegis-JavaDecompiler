@@ -41,7 +41,7 @@ public final class AegisFrame extends JFrame {
     private final JTextArea deobfuscation = Theme.codeArea();
     private final JTextArea mappingText = Theme.codeArea();
     private final JTextArea log = Theme.codeArea();
-    private final JLabel status = new JLabel("Ready — Aegis Native / zero third-party runtime dependencies");
+    private final JLabel status = new JLabel("Ready — Aegis Decompiler");
     private final JLabel fileLabel = new JLabel("No file open");
     private final JProgressBar progress = new JProgressBar();
     private final JCheckBox aggressive = new JCheckBox("Aggressive renamer");
@@ -92,7 +92,7 @@ public final class AegisFrame extends JFrame {
         exportBtn.addActionListener(e -> chooseExport()); saveMapBtn.addActionListener(e -> saveMappings());
         p.add(open); p.add(analyzeBtn); p.add(renameBtn); p.add(exportBtn); p.add(saveMapBtn);
         p.add(new JSeparator(SwingConstants.VERTICAL));
-        JLabel engine = new JLabel("Decompiler: Aegis Native"); engine.setForeground(Theme.ACCENT); p.add(engine);
+        JLabel engine = new JLabel("Decompiler: Aegis"); engine.setForeground(Theme.ACCENT); p.add(engine);
         aggressive.setToolTipText("Renames more private members in the source/mapping view."); p.add(aggressive);
         fileLabel.setForeground(Theme.MUTED); fileLabel.setBorder(new EmptyBorder(0,8,0,12));
         outer.add(p, BorderLayout.CENTER); outer.add(fileLabel, BorderLayout.EAST); return outer;
@@ -192,9 +192,17 @@ public final class AegisFrame extends JFrame {
     }
 
     private void saveMappings() {
-        if (mappings.isEmpty()) return; JFileChooser c=new JFileChooser(); c.setSelectedFile(new java.io.File("aegis-mappings.tiny"));
-        if (c.showSaveDialog(this)!=JFileChooser.APPROVE_OPTION) return; try { Files.writeString(c.getSelectedFile().toPath(),mappings.toTinyV2(), StandardCharsets.UTF_8); status.setText("Mappings saved"); }
-        catch(Exception ex){ error(ex); }
+        if (mappings.isEmpty()) return;
+        JFileChooser c=new JFileChooser(); c.setSelectedFile(new java.io.File("aegis-mappings.tiny"));
+        c.addChoosableFileFilter(new FileNameExtensionFilter("Tiny v2 mappings (*.tiny)","tiny"));
+        c.addChoosableFileFilter(new FileNameExtensionFilter("Aegis JSON mappings (*.json)","json"));
+        c.addChoosableFileFilter(new FileNameExtensionFilter("ProGuard-style mappings (*.map, *.txt)","map","txt"));
+        if (c.showSaveDialog(this)!=JFileChooser.APPROVE_OPTION) return;
+        try {
+            Path path=c.getSelectedFile().toPath();String n=path.getFileName().toString().toLowerCase(Locale.ROOT);
+            String data=n.endsWith(".json")?mappings.toJson():(n.endsWith(".map")||n.endsWith(".txt"))?mappings.toProGuard():mappings.toTinyV2();
+            Files.writeString(path,data,StandardCharsets.UTF_8); status.setText("Mappings saved: "+path.getFileName());
+        } catch(Exception ex){ error(ex); }
     }
 
     private <T> void task(String message, Callable<T> work, Consumer<T> done) {
