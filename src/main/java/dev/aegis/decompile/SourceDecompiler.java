@@ -31,33 +31,110 @@ public final class SourceDecompiler {
         out.append('\n');
         if (!pkg.isEmpty()) out.append("package ").append(pkg).append(";\n\n");
 
+        if (originalSource != null) {
+            String originalSimple = cf.thisClass(); int os = originalSimple.lastIndexOf('/'); if (os >= 0) originalSimple = originalSimple.substring(os + 1);
+            for (OriginalCommentRecovery.SourceComment c : OriginalCommentRecovery.forType(originalSource, originalSimple))
+                out.append(OriginalCommentRecovery.asTaggedLine(c)).append("\n");
+        }
+        List<RecordComponents.Component> recordComponents = RecordComponents.from(cf);
+        boolean recordType = !recordComponents.isEmpty() && "java/lang/Record".equals(cf.superClass());
+        List<String> permitted = ModernClassFeatures.permittedSubclasses(cf);
+        boolean sealedType = !permitted.isEmpty();
         String mods = AccessFlags.classModifiers(cf.accessFlags());
+        if (recordType) mods = mods.replace("final", "").replaceAll("\\s+", " ").trim();
         if (!mods.isEmpty()) out.append(mods).append(' ');
+        if (sealedType) out.append("sealed ");
         boolean annotation = AccessFlags.has(cf.accessFlags(), AccessFlags.ANNOTATION);
         boolean iface = AccessFlags.has(cf.accessFlags(), AccessFlags.INTERFACE);
         boolean enm = AccessFlags.has(cf.accessFlags(), AccessFlags.ENUM);
-        if (annotation) out.append("@interface ");
+        if (recordType) out.append("record ");
+        else if (annotation) out.append("@interface ");
         else if (enm) out.append("enum ");
         else if (iface) out.append("interface ");
         else out.append("class ");
         out.append(simple);
         GenericSignatureParser.ClassSig parsedClassSig = GenericSignatureParser.clazz(classSig, map);
         if (parsedClassSig != null && !parsedClassSig.typeParameters().isEmpty()) out.append(parsedClassSig.typeParameters());
+        if (recordType) {
+            out.append('(');
+            for (int i=0;i<recordComponents.size();i++) {
+                if(i>0)out.append(", "); RecordComponents.Component c=recordComponents.get(i);
+                String type=GenericSignatureParser.fieldType(c.genericSignature(),map);
+                if(type==null)try{type=map.mapJavaType(DescriptorParser.fieldType(c.descriptor()));}catch(RuntimeException ex){type="Object";}
+                out.append(type).append(' ').append(JavaNames.sanitize(map.fieldName(cf.thisClass(),c.name(),c.descriptor()),"component"+i));
+            }
+            out.append(')');
+        }
 
         String renderedSuper = parsedClassSig != null ? parsedClassSig.superType() : (cf.superClass()==null?null:javaClass(cf.superClass(),map));
         List<String> renderedInterfaces = parsedClassSig != null ? parsedClassSig.interfaces() : cf.interfaces().stream().map(x -> javaClass(x,map)).toList();
-        if (!iface && !enm && renderedSuper != null && !renderedSuper.equals("java.lang.Object")) out.append(" extends ").append(renderedSuper);
+        if (!recordType && !iface && !enm && renderedSuper != null && !renderedSuper.equals("java.lang.Object")) out.append(" extends ").append(renderedSuper);
         if (!renderedInterfaces.isEmpty()) {
             out.append(iface ? " extends " : " implements ");
             out.append(String.join(", ", renderedInterfaces));
         }
+        if (!permitted.isEmpty()) out.append(" permits ").append(String.join(", ", permitted.stream().map(x -> javaClass(x,map)).toList()));
         out.append(" {\n");
 
-        for (MemberInfo field : cf.fields()) emitField(out, cf, field, map);
+        Set<String> recordFields=new HashSet<>(); for(RecordComponents.Component c:recordComponents)recordFields.add(c.name()+"\u0000"+c.descriptor());
+        for (MemberInfo field : cf.fields()) if(!recordFields.contains(field.name()+"\u0000"+field.descriptor())) emitField(out, cf, field, map);
         if (!cf.fields().isEmpty() && !cf.methods().isEmpty()) out.append('\n');
-        for (MemberInfo method : cf.methods()) emitMethod(out, cf, method, map, simple, iface, originalSource);
+        for (MemberInfo method : cf.methods()) {
+            if (recordType && isImplicitRecordMethod(cf, method, recordComponents)) continue;
+            emitMethod(out, cf, method, map, simple, iface, originalSource);
+        }
         out.append("}\n");
         return out.toString();
+    }
+
+    private static boolean isImplicitRecordMethod(ClassFile cf, MemberInfo m, List<RecordComponents.Component> components) {
+        if (m.name().equals("<clinit>")) return false;
+        try {
+            if (m.name().equals("<init>")) return isTrivialRecordConstructor(cf,m,components);
+            for (RecordComponents.Component c:components) if (m.name().equals(c.name()) && m.descriptor().equals("()"+c.descriptor())) {
+                AttributeInfo ca=m.attribute("Code"); if(ca==null)return false;
+                List<Instruction> xs=BytecodeDecoder.decode(CodeAttribute.parse(ca,cf.constantPool()).code()).stream().filter(x->x.opcode()!=0).toList();
+                if(xs.size()==3&&xs.get(0).opcode()==42&&xs.get(1).opcode()==180&&xs.get(2).opcode()>=172&&xs.get(2).opcode()<=176){
+                    ConstantPool.MemberRef r=cf.constantPool().memberRef(xs.get(1).u2(0));
+                    if(r.owner().equals(cf.thisClass())&&r.name().equals(c.name())&&r.descriptor().equals(c.descriptor()))return true;
+                }
+            }
+            if (Set.of("equals","hashCode","toString").contains(m.name()) && usesObjectMethodsBootstrap(cf,m)) return true;
+        } catch(RuntimeException ignored) { }
+        return false;
+    }
+
+    private static boolean isTrivialRecordConstructor(ClassFile cf,MemberInfo m,List<RecordComponents.Component> components){
+        AttributeInfo ca=m.attribute("Code");if(ca==null)return false;
+        DescriptorParser.MethodDescriptor md=DescriptorParser.method(m.descriptor());
+        if(md.parameterTypes().size()!=components.size())return false;
+        for(int i=0;i<components.size();i++)if(!md.parameterTypes().get(i).equals(DescriptorParser.fieldType(components.get(i).descriptor())))return false;
+        List<Instruction> xs=BytecodeDecoder.decode(CodeAttribute.parse(ca,cf.constantPool()).code()).stream().filter(x->x.opcode()!=0).toList();
+        int pos=0;if(xs.size()<3||xs.get(pos++).opcode()!=42)return false;
+        Instruction superCall=xs.get(pos++);if(superCall.opcode()!=183)return false;
+        ConstantPool.MemberRef sr=cf.constantPool().memberRef(superCall.u2(0));if(!sr.owner().equals("java/lang/Record")||!sr.name().equals("<init>"))return false;
+        int slot=1;
+        for(RecordComponents.Component c:components){
+            if(pos+2>=xs.size()||xs.get(pos++).opcode()!=42)return false;
+            Instruction load=xs.get(pos++);Integer loaded=localLoadSlot(load);if(loaded==null||loaded!=slot)return false;
+            Instruction put=xs.get(pos++);if(put.opcode()!=181)return false;
+            ConstantPool.MemberRef fr=cf.constantPool().memberRef(put.u2(0));if(!fr.owner().equals(cf.thisClass())||!fr.name().equals(c.name())||!fr.descriptor().equals(c.descriptor()))return false;
+            String jt=DescriptorParser.fieldType(c.descriptor());slot+=(jt.equals("long")||jt.equals("double"))?2:1;
+        }
+        return pos==xs.size()-1&&xs.get(pos).opcode()==177;
+    }
+
+    private static Integer localLoadSlot(Instruction i){int op=i.opcode();if(op>=21&&op<=25)return i.u1(0);if(op>=26&&op<=45)return switch(op){case 26,30,34,38,42->0;case 27,31,35,39,43->1;case 28,32,36,40,44->2;default->3;};return null;}
+
+    private static boolean usesObjectMethodsBootstrap(ClassFile cf,MemberInfo m){
+        AttributeInfo ca=m.attribute("Code");if(ca==null)return false;BootstrapMethods bs=BootstrapMethods.from(cf);
+        for(Instruction i:BytecodeDecoder.decode(CodeAttribute.parse(ca,cf.constantPool()).code()))if(i.opcode()==186){
+            ConstantPool.DynamicRef d=cf.constantPool().dynamicRef(i.u2(0));BootstrapMethods.BootstrapMethod bm=bs.get(d.bootstrapMethodIndex());if(bm==null)continue;
+            ConstantPool.Entry e=cf.constantPool().entry(bm.methodHandleIndex());if(e instanceof ConstantPool.MethodHandleEntry h){
+                ConstantPool.MemberRef r=cf.constantPool().memberRef(h.referenceIndex());if(r.owner().equals("java/lang/runtime/ObjectMethods")&&r.name().equals("bootstrap"))return true;
+            }
+        }
+        return false;
     }
 
     private static void emitField(StringBuilder out, ClassFile cf, MemberInfo f, MappingSet map) {
@@ -204,7 +281,9 @@ public final class SourceDecompiler {
     private static String parameterName(ClassFile cf, MemberInfo m, DescriptorParser.MethodDescriptor md, int parameterIndex, String javaType, MappingSet map) {
         String fallback = SemanticNameEngine.parameterBase(javaType, parameterIndex);
         String mappedMethod = m.name().startsWith("<") ? m.name() : map.methodName(cf.thisClass(), m.name(), m.descriptor());
-        if (md.parameterTypes().size()==1 && !m.name().startsWith("<")) {
+        String usageName = semanticParameterFromBytecode(cf, m, md, parameterIndex, map);
+        if (usageName != null) fallback = usageName;
+        else if (md.parameterTypes().size()==1 && !m.name().startsWith("<")) {
             String semantic = semanticParameterFromMethod(mappedMethod, javaType);
             if (semantic != null) fallback = semantic;
         }
@@ -223,6 +302,52 @@ public final class SourceDecompiler {
         } catch (RuntimeException ignored) { }
         return JavaNames.sanitize(fallback, "param" + parameterIndex);
     }
+
+    private static String semanticParameterFromBytecode(ClassFile cf, MemberInfo m, DescriptorParser.MethodDescriptor md,
+                                                        int parameterIndex, MappingSet map) {
+        AttributeInfo ca=m.attribute("Code"); if(ca==null)return null;
+        int slot=AccessFlags.has(m.accessFlags(),AccessFlags.STATIC)?0:1;
+        for(int i=0;i<parameterIndex;i++)slot+=md.slotWidths().get(i);
+        try {
+            CodeAttribute code=CodeAttribute.parse(ca,cf.constantPool());
+            List<Instruction> xs=BytecodeDecoder.decode(code.code());
+            for(int i=0;i<xs.size();i++){
+                Instruction in=xs.get(i); Integer loaded=loadedLocal(in);
+                if(loaded==null||loaded!=slot)continue;
+                // Constructor/setter pattern: aload_0; <parameter>; putfield owner.field
+                for(int j=i+1;j<Math.min(xs.size(),i+4);j++){
+                    Instruction next=xs.get(j);
+                    if(next.opcode()==181){
+                        ConstantPool.MemberRef r=cf.constantPool().memberRef(next.u2(0));
+                        if(r.owner().equals(cf.thisClass()))return JavaNames.sanitize(map.fieldName(r.owner(),r.name(),r.descriptor()),"param"+parameterIndex);
+                    }
+                    if(isControlBoundary(next.opcode()))break;
+                }
+                // Direct argument to a meaningful one-argument API, e.g. setPath(path).
+                if(i+1<xs.size()){
+                    Instruction next=xs.get(i+1); int op=next.opcode();
+                    if(op>=182&&op<=185){
+                        ConstantPool.MemberRef r=cf.constantPool().memberRef(next.u2(0));
+                        DescriptorParser.MethodDescriptor called=DescriptorParser.method(r.descriptor());
+                        if(called.parameterTypes().size()==1 && JavaNames.isValidIdentifier(r.name()) && !JavaNames.isLikelyObfuscated(r.name())){
+                            String candidate=semanticParameterFromMethod(r.name(),md.parameterTypes().get(parameterIndex));
+                            if(candidate!=null)return JavaNames.sanitize(candidate,"param"+parameterIndex);
+                        }
+                    }
+                }
+            }
+        } catch(RuntimeException ignored) { }
+        return null;
+    }
+
+    private static Integer loadedLocal(Instruction i){
+        int op=i.opcode();
+        if(op>=21&&op<=25)return i.u1(0);
+        if(op>=26&&op<=45)return switch(op){case 26,30,34,38,42->0;case 27,31,35,39,43->1;case 28,32,36,40,44->2;default->3;};
+        return null;
+    }
+
+    private static boolean isControlBoundary(int op){return (op>=153&&op<=171)||op==167||op==200||op>=172&&op<=177||op==191;}
 
     private static String semanticParameterFromMethod(String methodName,String javaType) {
         if(methodName==null||methodName.isBlank())return null;
