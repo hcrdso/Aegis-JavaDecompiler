@@ -20,14 +20,14 @@ public final class SourceDecompiler {
 
         StringBuilder out = new StringBuilder();
         out.append("// Decompiled by Aegis - made by hcrdso\n");
-        out.append("// Classfile ").append(cf.majorVersion()).append('.').append(cf.minorVersion())
-                .append(" / Java ").append(cf.javaVersion()).append("\n");
+        out.append("// classfile ").append(cf.majorVersion()).append('.').append(cf.minorVersion())
+                .append(" / java ").append(cf.javaVersion()).append("\n");
         String sourceFile = DebugMetadata.sourceFile(cf);
-        if (sourceFile != null) out.append("// [recovered metadata] SourceFile: ").append(sourceFile).append("\n");
+        if (sourceFile != null) out.append("// [recovered metadata] sourcefile ").append(sourceFile).append("\n");
         List<String> smapFiles = DebugMetadata.smapSourceFiles(cf);
-        if (!smapFiles.isEmpty()) out.append("// [recovered metadata] SMAP sources: ").append(String.join(", ", smapFiles)).append("\n");
+        if (!smapFiles.isEmpty()) out.append("// [recovered metadata] smap sources ").append(String.join(", ", smapFiles)).append("\n");
         String classSig = DebugMetadata.genericSignature(cf);
-        if (classSig != null) out.append("// [recovered metadata] generic signature: ").append(classSig).append("\n");
+        if (classSig != null) out.append("// [recovered metadata] generic signature ").append(classSig).append("\n");
         out.append('\n');
         if (!pkg.isEmpty()) out.append("package ").append(pkg).append(";\n\n");
 
@@ -139,9 +139,9 @@ public final class SourceDecompiler {
 
     private static void emitField(StringBuilder out, ClassFile cf, MemberInfo f, MappingSet map) {
         MappingSet.Decision rename = map.fieldDecision(cf.thisClass(), f.name(), f.descriptor());
-        if (rename != null) out.append("    // [Aegis rename ").append(rename.confidence()).append("%] ").append(f.name()).append(" -> ").append(rename.target()).append(": ").append(rename.reason()).append("\n");
+        if (rename != null) out.append("    // ").append(commentText("aegis rename "+rename.confidence()+"% "+f.name()+" -> "+rename.target()+" "+rename.reason())).append("\n");
         String sig = DebugMetadata.genericSignature(f, cf.constantPool());
-        if (sig != null) out.append("    // [recovered metadata] generic signature: ").append(sig).append("\n");
+        if (sig != null) out.append("    // [recovered metadata] generic signature ").append(sig).append("\n");
         out.append("    ");
         String mods = AccessFlags.fieldModifiers(f.accessFlags());
         if (!mods.isEmpty()) out.append(mods).append(' ');
@@ -183,7 +183,7 @@ public final class SourceDecompiler {
                                    String currentSimpleName, boolean ownerIsInterface, String originalSource) {
         if (!m.name().startsWith("<")) {
             MappingSet.Decision rename = map.methodDecision(cf.thisClass(), m.name(), m.descriptor());
-            if (rename != null) out.append("    // [Aegis rename ").append(rename.confidence()).append("%] ").append(m.name()).append(" -> ").append(rename.target()).append(": ").append(rename.reason()).append("\n");
+            if (rename != null) out.append("    // ").append(commentText("aegis rename "+rename.confidence()+"% "+m.name()+" -> "+rename.target()+" "+rename.reason())).append("\n");
         }
         int[] sourceLines = DebugMetadata.lineRange(cf, m);
         if (sourceLines[0] > 0 && originalSource != null) {
@@ -197,13 +197,13 @@ public final class SourceDecompiler {
             out.append("\n");
         }
         String genericSig = DebugMetadata.genericSignature(m, cf.constantPool());
-        if (genericSig != null) out.append("    // [recovered metadata] generic signature: ").append(genericSig).append("\n");
+        if (genericSig != null) out.append("    // [recovered metadata] generic signature ").append(genericSig).append("\n");
         for (RecoveredCommentEngine.Comment c : new RecoveredCommentEngine().infer(cf, m, map)) {
-            out.append("    // [Aegis inferred comment ").append(c.confidence()).append("%] ").append(c.text()).append("\n");
+            out.append("    // ").append(commentText("aegis inferred comment "+c.confidence()+"% "+c.text())).append("\n");
         }
         if (m.name().equals("<clinit>")) {
             out.append("    static {\n");
-            emitBody(out, cf, m, map, 2, "void", List.of(), true);
+            emitBody(out, cf, m, map, 2, "void", List.of(), true, originalSource);
             out.append("    }\n\n");
             return;
         }
@@ -211,11 +211,18 @@ public final class SourceDecompiler {
         DescriptorParser.MethodDescriptor md;
         try { md = DescriptorParser.method(m.descriptor()); }
         catch (RuntimeException ex) {
-            out.append("    // Invalid descriptor: ").append(m.name()).append(m.descriptor()).append("\n\n");
+            out.append("    // ").append(commentText("invalid descriptor "+m.name()+m.descriptor())).append("\n\n");
             return;
         }
 
         GenericSignatureParser.MethodSig parsedMethodSig = GenericSignatureParser.method(genericSig, map);
+        String originalOwnerSimple = cf.thisClass();
+        int originalSlash = originalOwnerSimple.lastIndexOf('/');
+        if (originalSlash >= 0) originalOwnerSimple = originalOwnerSimple.substring(originalSlash + 1);
+        int originalDollar = originalOwnerSimple.lastIndexOf('$');
+        if (originalDollar >= 0) originalOwnerSimple = originalOwnerSimple.substring(originalDollar + 1);
+        SourceSymbolRecovery.MethodSymbols recoveredSymbols = originalSource == null ? null :
+                SourceSymbolRecovery.method(originalSource, sourceLines[0], sourceLines[1], md.parameterTypes().size(), m.name().equals("<init>"), originalOwnerSimple);
         out.append("    ");
         String mods = AccessFlags.methodModifiers(m.accessFlags());
         if (!mods.isEmpty()) out.append(mods).append(' ');
@@ -227,8 +234,11 @@ public final class SourceDecompiler {
         String returnType = parsedMethodSig != null ? parsedMethodSig.returnType() : map.mapJavaType(md.returnType());
         if (!constructor && parsedMethodSig != null && !parsedMethodSig.typeParameters().isEmpty()) out.append(parsedMethodSig.typeParameters()).append(' ');
         if (constructor) out.append(currentSimpleName);
-        else out.append(returnType).append(' ')
-                .append(JavaNames.sanitize(map.methodName(cf.thisClass(), m.name(), m.descriptor()), "method"));
+        else {
+            String methodName = map.methodName(cf.thisClass(), m.name(), m.descriptor());
+            if (recoveredSymbols != null && JavaNames.isValidIdentifier(recoveredSymbols.name()) && !JavaNames.isKeyword(recoveredSymbols.name())) methodName = recoveredSymbols.name();
+            out.append(returnType).append(' ').append(JavaNames.sanitize(methodName, "method"));
+        }
         out.append('(');
 
         List<String> paramNames = new ArrayList<>();
@@ -240,7 +250,9 @@ public final class SourceDecompiler {
             if (AccessFlags.has(m.accessFlags(), AccessFlags.VARARGS) && i == md.parameterTypes().size() - 1 && type.endsWith("[]")) {
                 type = type.substring(0, type.length() - 2) + "...";
             }
-            String p = parameterName(cf, m, md, i, type, map);
+            String p = recoveredSymbols != null && i < recoveredSymbols.parameterNames().size()
+                    ? JavaNames.sanitize(recoveredSymbols.parameterNames().get(i), "param" + i)
+                    : parameterName(cf, m, md, i, type, map);
             String base = p; int suffix = 2; while (usedParamNames.contains(p)) p = base + suffix++;
             usedParamNames.add(p);
             paramNames.add(p);
@@ -254,27 +266,25 @@ public final class SourceDecompiler {
         boolean noCode = AccessFlags.has(m.accessFlags(), AccessFlags.ABSTRACT) || AccessFlags.has(m.accessFlags(), AccessFlags.NATIVE) || m.attribute("Code") == null;
         if (noCode) { out.append(";\n\n"); return; }
         out.append(" {\n");
-        emitBody(out, cf, m, map, 2, returnType, paramNames, false);
+        emitBody(out, cf, m, map, 2, returnType, paramNames, false, originalSource);
         out.append("    }\n\n");
     }
 
     private static void emitBody(StringBuilder out, ClassFile cf, MemberInfo m, MappingSet map, int indent,
-                                 String returnType, List<String> params, boolean staticInitializer) {
+                                 String returnType, List<String> params, boolean staticInitializer, String originalSource) {
         AttributeInfo a = m.attribute("Code");
         if (a == null) return;
         try {
             CodeAttribute code = CodeAttribute.parse(a, cf.constantPool());
-            MethodBodyDecompiler.Result result = MethodBodyDecompiler.decompile(cf, m, code, map, params);
+            int[] sourceRange = DebugMetadata.lineRange(cf, m);
+            Map<Integer,List<String>> sourceLocals = originalSource == null ? Map.of() : SourceSymbolRecovery.localNamesByLine(originalSource, sourceRange[0], sourceRange[1]);
+            MethodBodyDecompiler.Result result = MethodBodyDecompiler.decompile(cf, m, code, map, params, sourceLocals);
             for (String line : result.lines()) out.append("    ".repeat(indent)).append(line).append('\n');
-            if (!result.complete() && !staticInitializer) {
-                if (!returnType.equals("void") && !result.hasTerminalReturn()) {
-                    out.append("    ".repeat(indent)).append("return ").append(DescriptorParser.defaultValue(returnType)).append("; // Aegis fallback\n");
-                }
+            if (!result.complete() && !staticInitializer && !result.hasTerminalReturn()) {
+                out.append("    ".repeat(indent)).append("// incomplete reconstruction no synthetic return inserted\n");
             }
         } catch (RuntimeException ex) {
-            out.append("    ".repeat(indent)).append("// Aegis parser error: ").append(safe(ex.getMessage())).append('\n');
-            if (!returnType.equals("void") && !staticInitializer)
-                out.append("    ".repeat(indent)).append("return ").append(DescriptorParser.defaultValue(returnType)).append(";\n");
+            out.append("    ".repeat(indent)).append("// ").append(commentText("aegis parser error "+safe(ex.getMessage()))).append('\n');
         }
     }
 
@@ -314,7 +324,6 @@ public final class SourceDecompiler {
             for(int i=0;i<xs.size();i++){
                 Instruction in=xs.get(i); Integer loaded=loadedLocal(in);
                 if(loaded==null||loaded!=slot)continue;
-                // Constructor/setter pattern: aload_0; <parameter>; putfield owner.field
                 for(int j=i+1;j<Math.min(xs.size(),i+4);j++){
                     Instruction next=xs.get(j);
                     if(next.opcode()==181){
@@ -323,7 +332,6 @@ public final class SourceDecompiler {
                     }
                     if(isControlBoundary(next.opcode()))break;
                 }
-                // Direct argument to a meaningful one-argument API, e.g. setPath(path).
                 if(i+1<xs.size()){
                     Instruction next=xs.get(i+1); int op=next.opcode();
                     if(op>=182&&op<=185){
@@ -379,6 +387,10 @@ public final class SourceDecompiler {
         if (internal == null) return "java.lang.Object";
         if (internal.startsWith("[")) return map.mapJavaType(DescriptorParser.fieldType(internal));
         return map.className(internal).replace('/', '.').replace('$', '.');
+    }
+
+    private static String commentText(String s) {
+        return (s == null ? "" : s).toLowerCase(Locale.ROOT).replace(".", "").replace(",", "");
     }
 
     private static String safe(String s) {
