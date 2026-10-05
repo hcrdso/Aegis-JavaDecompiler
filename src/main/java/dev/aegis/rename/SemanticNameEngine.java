@@ -48,7 +48,9 @@ public final class SemanticNameEngine {
             return new Candidate("lambdaBody"+capitalize(JavaNames.sanitize(owner,"Body"))+id,98,"compiler lambda helper renamed to avoid javac synthetic-name collision");
         }
         if(m.name().startsWith("access$"))return new Candidate("syntheticAccess"+m.name().substring("access$".length()),94,"compiler synthetic access bridge");
-        Candidate a=accessorCandidate(cf,m,mappings); if(a!=null)return a;
+
+        ArrayList<Candidate> evidence=new ArrayList<>();
+        Candidate a=accessorCandidate(cf,m,mappings); if(a!=null)evidence.add(a);
         AttributeInfo ca=m.attribute("Code");
         DescriptorParser.MethodDescriptor md;
         try{md=DescriptorParser.method(m.descriptor());}catch(RuntimeException ex){return new Candidate("method",20,"invalid descriptor");}
@@ -56,22 +58,26 @@ public final class SemanticNameEngine {
             try{
                 CodeAttribute code=CodeAttribute.parse(ca,cf.constantPool());
                 List<Instruction> xs=BytecodeDecoder.decode(code.code());
-                Candidate delegate=delegateCandidate(cf,m,xs); if(delegate!=null)return delegate;
-                Candidate strings=stringCandidate(cf,xs); if(strings!=null)return strings;
-                Candidate shape=shapeCandidate(cf,m,md,xs); if(shape!=null)return shape;
+                Candidate delegate=delegateCandidate(cf,m,xs); if(delegate!=null)evidence.add(delegate);
+                Candidate strings=stringCandidate(cf,xs); if(strings!=null)evidence.add(strings);
+                Candidate shape=shapeCandidate(cf,m,md,xs); if(shape!=null)evidence.add(shape);
+                Candidate cluster=callClusterCandidate(cf,md,xs); if(cluster!=null)evidence.add(cluster);
             }catch(RuntimeException ignored){}
         }
+
         String ret=md.returnType();
-        if("boolean".equals(ret))return new Candidate("isValid",46,"boolean-returning method");
-        if("void".equals(ret)){
-            if(md.parameterTypes().isEmpty())return new Candidate("runAction",36,"void no-arg method");
-            return new Candidate("process",34,"void method");
+        if("boolean".equals(ret))evidence.add(new Candidate("isValid",46,"boolean-returning method"));
+        else if("void".equals(ret)){
+            if(md.parameterTypes().isEmpty())evidence.add(new Candidate("runAction",36,"void no-arg method"));
+            else evidence.add(new Candidate("process",34,"void method"));
+        } else {
+            String simple=simpleJavaType(ret);
+            if(simple.equals("String"))evidence.add(new Candidate("getText",44,"returns String"));
+            else if(simple.equals("Iterator"))evidence.add(new Candidate("iterator",80,"returns Iterator"));
+            else if(simple.equals("CompletableFuture"))evidence.add(new Candidate("schedule",50,"returns CompletableFuture"));
+            else evidence.add(new Candidate("get"+capitalize(simple),38,"return type "+simple));
         }
-        String simple=simpleJavaType(ret);
-        if(simple.equals("String"))return new Candidate("getText",44,"returns String");
-        if(simple.equals("Iterator"))return new Candidate("iterator",80,"returns Iterator");
-        if(simple.equals("CompletableFuture"))return new Candidate("schedule",50,"returns CompletableFuture");
-        return new Candidate("get"+capitalize(simple),38,"return type "+simple);
+        return chooseEvidence(evidence,"method",30);
     }
 
     private Candidate accessorCandidate(ClassFile cf, MemberInfo m, MappingSet mappings){
@@ -127,6 +133,55 @@ public final class SemanticNameEngine {
             }catch(RuntimeException ignored){}
         }
         return best;
+    }
+
+    private Candidate callClusterCandidate(ClassFile cf,DescriptorParser.MethodDescriptor md,List<Instruction> xs){
+        Map<String,Integer> verbs=new LinkedHashMap<>();
+        Map<String,Integer> nouns=new LinkedHashMap<>();
+        for(Instruction i:xs){
+            if(i.opcode()<182||i.opcode()>185)continue;
+            try{
+                ConstantPool.MemberRef r=cf.constantPool().memberRef(i.u2(0));
+                if(BORING_CALLS.contains(r.name())||JavaNames.isLikelyObfuscated(r.name()))continue;
+                String lower=r.name().toLowerCase(Locale.ROOT);
+                for(String v:VERBS)if(lower.startsWith(v)){verbs.merge(v,1,Integer::sum);break;}
+                String owner=semanticTypeNoun(simpleInternal(r.owner()));
+                if(owner.length()>3&&!Set.of("string","object","iterator","list","map","set","class").contains(owner))nouns.merge(owner,1,Integer::sum);
+            }catch(RuntimeException ignored){}
+        }
+        if(verbs.isEmpty())return null;
+        var best=verbs.entrySet().stream().max(Map.Entry.<String,Integer>comparingByValue().thenComparing(Map.Entry::getKey)).orElse(null);
+        if(best==null||best.getValue()<2)return null;
+        long ties=verbs.values().stream().filter(v->v.equals(best.getValue())).count(); if(ties>1)return null;
+        String noun=nouns.entrySet().stream().max(Map.Entry.<String,Integer>comparingByValue().thenComparing(Map.Entry::getKey)).map(Map.Entry::getKey).orElse("");
+        String name=best.getKey();
+        if(!noun.isBlank()&&!name.endsWith(noun))name+=capitalize(singular(noun));
+        int confidence=Math.min(76,56+best.getValue()*5);
+        return new Candidate(name,confidence,"dominant call cluster: "+best.getKey()+" ("+best.getValue()+" call(s))"+(noun.isBlank()?"":" around "+noun));
+    }
+
+    private static Candidate chooseEvidence(List<Candidate> evidence,String fallback,int fallbackConfidence){
+        if(evidence==null||evidence.isEmpty())return new Candidate(fallback,fallbackConfidence,"no strong semantic evidence");
+        record Vote(String name,int max,int total,int count,LinkedHashSet<String> reasons){}
+        LinkedHashMap<String,Vote> votes=new LinkedHashMap<>();
+        for(Candidate c:evidence){
+            if(c==null||c.name()==null||c.name().isBlank())continue;
+            String key=JavaNames.sanitize(c.name(),fallback);
+            Vote old=votes.get(key);
+            if(old==null){LinkedHashSet<String> rs=new LinkedHashSet<>();rs.add(c.reason());votes.put(key,new Vote(key,c.confidence(),c.confidence(),1,rs));}
+            else {LinkedHashSet<String> rs=new LinkedHashSet<>(old.reasons());rs.add(c.reason());votes.put(key,new Vote(key,Math.max(old.max(),c.confidence()),old.total()+c.confidence(),old.count()+1,rs));}
+        }
+        Vote best=null;int bestScore=-1;
+        for(Vote v:votes.values()){
+            int consensus=Math.min(14,(v.count()-1)*6);
+            int support=Math.min(8,Math.max(0,(v.total()-v.max())/35));
+            int score=Math.min(100,v.max()+consensus+support);
+            if(score>bestScore||(score==bestScore&&best!=null&&v.max()>best.max())){best=v;bestScore=score;}
+        }
+        if(best==null)return new Candidate(fallback,fallbackConfidence,"no usable semantic evidence");
+        String reason=String.join("; ",best.reasons());
+        if(best.count()>1)reason += "; corroborated by "+best.count()+" independent signal(s)";
+        return new Candidate(best.name(),bestScore,reason);
     }
 
     private Candidate shapeCandidate(ClassFile cf,MemberInfo m,DescriptorParser.MethodDescriptor md,List<Instruction> xs){
