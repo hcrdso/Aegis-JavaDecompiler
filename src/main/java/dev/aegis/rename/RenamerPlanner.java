@@ -1,6 +1,7 @@
 package dev.aegis.rename;
 
 import dev.aegis.classfile.*;
+import dev.aegis.decompile.SourceSymbolRecovery;
 import dev.aegis.util.JavaNames;
 import dev.aegis.workspace.*;
 import java.util.*;
@@ -20,13 +21,13 @@ public final class RenamerPlanner {
         HierarchyIndex hierarchy = new HierarchyIndex(workspace);
         ReflectionUsageAnalyzer.Result reflection = new ReflectionUsageAnalyzer().scan(hierarchy.classes().values());
 
-        planClasses(hierarchy, reflection, aggressive, mappings);
-        planFields(hierarchy, reflection, aggressive, mappings);
-        planMethods(hierarchy, reflection, aggressive, mappings);
+        planClasses(workspace, hierarchy, reflection, aggressive, mappings);
+        planFields(workspace, hierarchy, reflection, aggressive, mappings);
+        planMethods(workspace, hierarchy, reflection, aggressive, mappings);
         return mappings;
     }
 
-    private void planClasses(HierarchyIndex hierarchy, ReflectionUsageAnalyzer.Result reflection,
+    private void planClasses(Workspace workspace, HierarchyIndex hierarchy, ReflectionUsageAnalyzer.Result reflection,
                              boolean aggressive, MappingSet mappings) {
         Map<String,Set<String>> usedByPackage = new HashMap<>();
         for (String name : hierarchy.classes().keySet()) {
@@ -40,7 +41,8 @@ public final class RenamerPlanner {
             if(!suspicious && !aggressive)continue;
             if(!aggressive && reflection.classNames().contains(cf.thisClass()))continue;
             if(!suspicious && (AccessFlags.has(cf.accessFlags(),AccessFlags.PUBLIC)||AccessFlags.has(cf.accessFlags(),AccessFlags.PROTECTED)))continue;
-            SemanticNameEngine.Candidate c=semantics.classCandidate(cf,ordinal++);
+            SemanticNameEngine.Candidate c=sourceClassCandidate(workspace,cf);
+            if(c==null)c=semantics.classCandidate(cf,ordinal++);
             String pkg=packagePrefix(cf.thisClass());
             String targetSimple=uniqueClassName(JavaNames.sanitize(c.name(),"RecoveredClass"),usedByPackage.computeIfAbsent(pkg,k->new HashSet<>()));
             usedByPackage.get(pkg).add(targetSimple);
@@ -48,18 +50,34 @@ public final class RenamerPlanner {
         }
     }
 
-    private void planFields(HierarchyIndex hierarchy, ReflectionUsageAnalyzer.Result reflection,
+    private static SemanticNameEngine.Candidate sourceClassCandidate(Workspace workspace, ClassFile cf) {
+        if (cf.thisClass().contains("$")) return null;
+        String sourceFile = DebugMetadata.sourceFile(cf);
+        if (sourceFile == null || !sourceFile.endsWith(".java")) return null;
+        String base = sourceFile.substring(0, sourceFile.length() - 5);
+        if (!JavaNames.isValidIdentifier(base) || JavaNames.isKeyword(base)) return null;
+        Optional<String> source = workspace.bundledSource(cf.thisClass(), sourceFile);
+        if (source.isEmpty()) return null;
+        String pattern = "(?s)\\b(?:class|interface|enum|record)\\s+" + java.util.regex.Pattern.quote(base) + "\\b";
+        if (!java.util.regex.Pattern.compile(pattern).matcher(source.get()).find()) return null;
+        return new SemanticNameEngine.Candidate(base,100,"name recovered from attached source metadata");
+    }
+
+    private void planFields(Workspace workspace, HierarchyIndex hierarchy, ReflectionUsageAnalyzer.Result reflection,
                             boolean aggressive, MappingSet mappings) {
         for(ClassFile cf:hierarchy.classes().values()){
+            List<SourceSymbolRecovery.FieldSymbol> sourceFields=sourceFields(workspace,cf);
             HashSet<String> used=new HashSet<>();
             for(MemberInfo f:cf.fields()) if(!isLikelyObfuscatedFieldName(f.name()))used.add(f.name());
-            for(MemberInfo f:cf.fields()){
+            for(int fieldIndex=0;fieldIndex<cf.fields().size();fieldIndex++){
+                MemberInfo f=cf.fields().get(fieldIndex);
                 if(isSpecialField(f))continue;
                 boolean suspicious=isLikelyObfuscatedFieldName(f.name());
                 boolean rename=suspicious||(aggressive&&AccessFlags.has(f.accessFlags(),AccessFlags.PRIVATE));
                 if(!rename)continue;
                 if(!aggressive&&reflection.memberNames().contains(f.name()))continue;
-                SemanticNameEngine.Candidate c=semantics.fieldCandidate(cf,f);
+                SemanticNameEngine.Candidate c=sourceFieldCandidate(cf,f,fieldIndex,sourceFields);
+                if(c==null)c=semantics.fieldCandidate(cf,f);
                 String base=JavaNames.sanitize(c.name(),"value");
                 String target=unique(base,used);
                 used.add(target);
@@ -71,7 +89,7 @@ public final class RenamerPlanner {
         }
     }
 
-    private void planMethods(HierarchyIndex hierarchy, ReflectionUsageAnalyzer.Result reflection,
+    private void planMethods(Workspace workspace, HierarchyIndex hierarchy, ReflectionUsageAnalyzer.Result reflection,
                              boolean aggressive, MappingSet mappings) {
         // Java source cannot overload solely by return type. Track target-name + argument-list per owner.
         Map<String,Set<String>> usedSignatures=new HashMap<>();
@@ -99,10 +117,10 @@ public final class RenamerPlanner {
             }
             if(preserve||!anyRename)continue;
 
-            SemanticNameEngine.Candidate best=null;
-            if(meaningfulExisting!=null){
+            SemanticNameEngine.Candidate best=sourceMethodCandidate(workspace,hierarchy,group);
+            if(best==null&&meaningfulExisting!=null){
                 best=new SemanticNameEngine.Candidate(meaningfulExisting,98,"meaningful name retained elsewhere in override group");
-            } else {
+            } else if(best==null) {
                 for(HierarchyIndex.MethodId id:group){
                     MemberInfo m=hierarchy.method(id);if(m==null)continue;
                     SemanticNameEngine.Candidate c=semantics.methodCandidate(hierarchy.classFile(id.owner()),m,mappings);
@@ -136,6 +154,80 @@ public final class RenamerPlanner {
             String target=bridgeTarget(cf,m,mappings);
             if(target!=null&&!target.equals(m.name()))mappings.mapMethod(cf.thisClass(),m.name(),m.descriptor(),target,91,"synthetic bridge forwards to "+target);
         }
+    }
+
+
+    private static List<SourceSymbolRecovery.FieldSymbol> sourceFields(Workspace workspace, ClassFile cf) {
+        String sourceFile=DebugMetadata.sourceFile(cf);
+        if(sourceFile==null)return List.of();
+        Optional<String> source=workspace.bundledSource(cf.thisClass(),sourceFile);
+        return source.map(SourceSymbolRecovery::fields).orElseGet(List::of);
+    }
+
+    private static SemanticNameEngine.Candidate sourceFieldCandidate(ClassFile cf,MemberInfo field,int index,List<SourceSymbolRecovery.FieldSymbol> sourceFields){
+        if(sourceFields.size()!=cf.fields().size()||index<0||index>=sourceFields.size())return null;
+        SourceSymbolRecovery.FieldSymbol symbol=sourceFields.get(index);
+        if(!fieldTypeMatchesSource(field.descriptor(),symbol.type()))return null;
+        return new SemanticNameEngine.Candidate(symbol.name(),100,"name recovered from attached source field order and type");
+    }
+
+    private static boolean fieldTypeMatchesSource(String descriptor,String sourceType){
+        String d=descriptorSimpleType(descriptor);
+        String s=sourceSimpleType(sourceType);
+        return d.equals(s)||d.endsWith("."+s)||s.endsWith("."+d);
+    }
+
+    private static String descriptorSimpleType(String descriptor){
+        int arrays=0;
+        while(arrays<descriptor.length()&&descriptor.charAt(arrays)=='[')arrays++;
+        String core=descriptor.substring(arrays);
+        String base=switch(core.charAt(0)){
+            case 'Z'->"boolean";case 'B'->"byte";case 'C'->"char";case 'S'->"short";case 'I'->"int";case 'J'->"long";case 'F'->"float";case 'D'->"double";
+            case 'L'->{String x=core.substring(1,core.length()-1).replace('/','.');int p=x.lastIndexOf('.');yield p<0?x:x.substring(p+1);}
+            default->core;
+        };
+        return base+"[]".repeat(arrays);
+    }
+
+    private static String sourceSimpleType(String sourceType){
+        StringBuilder out=new StringBuilder();
+        int angle=0;
+        for(int i=0;i<sourceType.length();i++){
+            char c=sourceType.charAt(i);
+            if(c=='<'){angle++;continue;}
+            if(c=='>'){angle=Math.max(0,angle-1);continue;}
+            if(angle==0&&!Character.isWhitespace(c))out.append(c);
+        }
+        String x=out.toString().replace("...","[]");
+        int arr=x.indexOf('[');
+        String suffix=arr>=0?x.substring(arr):"";
+        String core=arr>=0?x.substring(0,arr):x;
+        int dot=core.lastIndexOf('.');
+        if(dot>=0)core=core.substring(dot+1);
+        return core+suffix;
+    }
+
+    private static SemanticNameEngine.Candidate sourceMethodCandidate(Workspace workspace, HierarchyIndex hierarchy, List<HierarchyIndex.MethodId> group) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (HierarchyIndex.MethodId id : group) {
+            MemberInfo method = hierarchy.method(id);
+            ClassFile cf = hierarchy.classFile(id.owner());
+            if (method == null || cf == null || method.name().startsWith("<")) continue;
+            int[] range = DebugMetadata.lineRange(cf, method);
+            if (range[0] <= 0) continue;
+            String sourceFile = DebugMetadata.sourceFile(cf);
+            Optional<String> source = workspace.bundledSource(cf.thisClass(), sourceFile);
+            if (source.isEmpty()) continue;
+            DescriptorParser.MethodDescriptor md;
+            try { md = DescriptorParser.method(method.descriptor()); } catch (RuntimeException ex) { continue; }
+            String owner = simple(cf.thisClass());
+            int dollar = owner.lastIndexOf('$');
+            if (dollar >= 0 && dollar + 1 < owner.length()) owner = owner.substring(dollar + 1);
+            SourceSymbolRecovery.MethodSymbols recovered = SourceSymbolRecovery.method(source.get(), range[0], range[1], md.parameterTypes().size(), false, owner);
+            if (recovered != null && JavaNames.isValidIdentifier(recovered.name()) && !JavaNames.isKeyword(recovered.name())) names.add(recovered.name());
+        }
+        if (names.size() == 1) return new SemanticNameEngine.Candidate(names.iterator().next(),100,"name recovered from attached source and line metadata");
+        return null;
     }
 
     private static boolean conflicts(List<HierarchyIndex.MethodId> group,String target,Map<String,Set<String>> used){
