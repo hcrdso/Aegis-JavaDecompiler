@@ -28,8 +28,8 @@ if errorlevel 1 exit /b 1
 
 >build\manifest.mf echo Manifest-Version: 1.0
 >>build\manifest.mf echo Main-Class: dev.aegis.Aegis
->>build\manifest.mf echo Implementation-Title: Aegis Retro Intelligence
->>build\manifest.mf echo Implementation-Version: 0.4.0-retro-intelligence
+>>build\manifest.mf echo Implementation-Title: Aegis Semantic Recovery
+>>build\manifest.mf echo Implementation-Version: 0.5.0-semantic-recovery
 >>build\manifest.mf echo.
 
 echo [Aegis] Creating build\Aegis.jar...
