@@ -246,3 +246,5 @@ A universal perfect decompiler or original-name oracle is not possible when info
 - complete monitor-to-`synchronized` restructuring;
 - runtime-generated reflection names;
 - virtualization/VM-based obfuscators;
+
+### This will be the final version because I'm too lazy to continue. This will be the final version because I'm too lazy to continue. But maybe I'll update it once in a while.
